@@ -24,6 +24,14 @@ pub enum AppAction {
     ToggleHidden,
     /// Request delete of selected item (x)
     DeleteItem,
+    /// Switch between Disk and Projects views (p / Tab)
+    ToggleMode,
+    /// Request clean of the selected project's artifacts (c)
+    CleanProject,
+    /// Request clean of ALL projects' artifacts (C)
+    CleanAllProjects,
+    /// Re-scan the current view (r)
+    Refresh,
 }
 
 /// Result of a key press during the delete confirmation dialog.
@@ -50,6 +58,15 @@ pub fn handle_key(key: KeyEvent) -> Option<AppAction> {
         KeyCode::Char('G') => Some(AppAction::JumpBottom),
         KeyCode::Char('.') => Some(AppAction::ToggleHidden),
         KeyCode::Char('x') => Some(AppAction::DeleteItem),
+        KeyCode::Tab | KeyCode::Char('p') => Some(AppAction::ToggleMode),
+        // Plain `c` cleans a project; Ctrl-C still quits (handled by the
+        // guarded arm below — this must not match when Control is held).
+        KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(AppAction::CleanProject)
+        }
+        // `C` (shift-c) cleans every project at once.
+        KeyCode::Char('C') => Some(AppAction::CleanAllProjects),
+        KeyCode::Char('r') => Some(AppAction::Refresh),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(AppAction::Quit)
         }

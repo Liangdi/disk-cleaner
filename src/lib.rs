@@ -6,7 +6,12 @@ use std::fs;
 use std::path::Path;
 
 mod ffi;
+pub mod projects;
 pub mod tui;
+
+pub use projects::{
+    analyze, clean, dir_size, scan, Project, ProjectAnalysis, ProjectType, ScanError, ScanOptions,
+};
 
 #[derive(Serialize, Clone)]
 pub struct DiskItem {

@@ -14,7 +14,7 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::{DiskItem, FileInfo};
+use crate::{analyze, DiskItem, FileInfo, ScanOptions};
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -24,7 +24,17 @@ struct ScanResult {
     items: Option<Vec<app::FlatItem>>,
     path: String,
     total_size: u64,
+    // Populated on scan failure but not currently surfaced (the user stays on
+    // the last view); retained for future error reporting.
+    #[allow(dead_code)]
     error: Option<String>,
+}
+
+/// Message sent from the projects-scan thread to the main thread.
+struct ProjectScanResult {
+    entries: Vec<app::ProjectEntry>,
+    /// Non-empty after a clean-all: per-project failures to surface to the user.
+    errors: Vec<String>,
 }
 
 /// Run the interactive TUI with an explicit apparent flag.
@@ -72,6 +82,7 @@ pub fn run_from_path(path: String, apparent: bool) -> Result<(), Box<dyn Error>>
 
 fn run_loop(terminal: &mut Tui, state: &mut app::AppState) -> Result<(), Box<dyn Error>> {
     let (scan_tx, scan_rx) = mpsc::channel::<ScanResult>();
+    let (project_tx, project_rx) = mpsc::channel::<ProjectScanResult>();
 
     // Kick off initial shallow scan
     if state.loading {
@@ -79,7 +90,7 @@ fn run_loop(terminal: &mut Tui, state: &mut app::AppState) -> Result<(), Box<dyn
     }
 
     loop {
-        // Check if a scan completed
+        // Check if a disk scan completed
         if state.loading {
             if let Ok(result) = scan_rx.try_recv() {
                 state.loading = false;
@@ -94,19 +105,44 @@ fn run_loop(terminal: &mut Tui, state: &mut app::AppState) -> Result<(), Box<dyn
             }
         }
 
+        // Check if a projects scan completed
+        if state.projects_loading {
+            if let Ok(result) = project_rx.try_recv() {
+                state.projects_loading = false;
+                state.set_projects(result.entries);
+                if !result.errors.is_empty() {
+                    state.error_message = Some(format!(
+                        "{} project(s) failed to clean: {}",
+                        result.errors.len(),
+                        result.errors.join("; ")
+                    ));
+                }
+            } else {
+                state.loading_frame = state.loading_frame.wrapping_add(1);
+            }
+        }
+
         let viewport_height = terminal.size()?.height as usize;
-        if !state.loading {
+        let mode_loading = match state.mode {
+            app::AppMode::Disk => state.loading,
+            app::AppMode::Projects => state.projects_loading,
+        };
+        if !mode_loading {
             let list_height = viewport_height.saturating_sub(2);
-            state.adjust_scroll(list_height);
+            match state.mode {
+                app::AppMode::Disk => state.adjust_scroll(list_height),
+                app::AppMode::Projects => state.projects_adjust_scroll(list_height),
+            }
         }
 
         let detail = state.detail_stats_cloned();
-        terminal.draw(|f| ui::render(f, state, &detail))?;
+        let project_detail = state.project_detail_cloned();
+        terminal.draw(|f| ui::render(f, state, &detail, &project_detail))?;
 
         if crossterm_event::poll(std::time::Duration::from_millis(100))? {
             match crossterm_event::read()? {
                 crossterm_event::Event::Key(key) => {
-                    if state.loading {
+                    if mode_loading {
                         if let Some(action) = event::handle_key(key) {
                             if let event::AppAction::Quit = action {
                                 break;
@@ -134,7 +170,7 @@ fn run_loop(terminal: &mut Tui, state: &mut app::AppState) -> Result<(), Box<dyn
                         continue;
                     }
 
-                    // Delete confirmation dialog mode
+                    // Delete confirmation dialog mode (disk)
                     if state.delete_target.is_some() {
                         match event::handle_delete_confirm_key(key) {
                             event::DeleteConfirmAction::Confirm => {
@@ -172,58 +208,173 @@ fn run_loop(terminal: &mut Tui, state: &mut app::AppState) -> Result<(), Box<dyn
                         continue;
                     }
 
+                    // Clean confirmation dialog mode (projects)
+                    if state.clean_target.is_some() {
+                        match event::handle_delete_confirm_key(key) {
+                            event::DeleteConfirmAction::Confirm => {
+                                let path = state
+                                    .clean_target
+                                    .and_then(|i| state.projects.get(i).map(|e| e.path.clone()));
+                                match path {
+                                    Some(path) => {
+                                        match crate::clean(std::path::Path::new(&path)) {
+                                            Ok(()) => {
+                                                state.remove_cleaned_project();
+                                                // Files were deleted: the cached disk
+                                                // tree is now stale.
+                                                state.disk_stale = true;
+                                            }
+                                            Err(e) => {
+                                                state.error_message =
+                                                    Some(format!("Clean failed: {}", e));
+                                                state.cancel_clean();
+                                            }
+                                        }
+                                    }
+                                    None => state.cancel_clean(),
+                                }
+                            }
+                            event::DeleteConfirmAction::Cancel => state.cancel_clean(),
+                            event::DeleteConfirmAction::Ignore => {}
+                        }
+                        continue;
+                    }
+
+                    // Clean-ALL confirmation dialog mode (projects)
+                    if state.clean_all_pending {
+                        match event::handle_delete_confirm_key(key) {
+                            event::DeleteConfirmAction::Confirm => {
+                                start_clean_all(&project_tx, state);
+                            }
+                            event::DeleteConfirmAction::Cancel => state.cancel_clean_all(),
+                            event::DeleteConfirmAction::Ignore => {}
+                        }
+                        continue;
+                    }
+
                     if let Some(action) = event::handle_key(key) {
-                        match action {
-                            event::AppAction::Quit => break,
-                            event::AppAction::Up => state.move_up(),
-                            event::AppAction::Down => state.move_down(),
-                            event::AppAction::Enter => state.enter(),
-                            event::AppAction::Back => state.back(),
-                            event::AppAction::Toggle => state.toggle_expand(),
-                            event::AppAction::JumpTop => state.jump_top(),
-                            event::AppAction::JumpBottom => state.jump_bottom(),
-                            event::AppAction::ToggleHidden => {
-                                state.show_hidden = !state.show_hidden;
-                                state.compute_visible();
-                            }
-                            event::AppAction::DeleteItem => {
-                                state.request_delete();
-                            }
-                            event::AppAction::ToggleApparent => {
-                                state.apparent = !state.apparent;
-                                start_shallow_scan(
-                                    &scan_tx,
-                                    state.root_path.clone(),
-                                    state.apparent,
-                                    state,
-                                );
-                            }
-                            event::AppAction::StartSearch => {
-                                state.search_active = true;
-                                state.search_query.clear();
-                            }
-                            event::AppAction::EnterDir => {
-                                state.enter_dir();
-                                if let Some(new_path) = state.rescan_path.take() {
+                        // Any normal action dismisses a prior error message.
+                        state.error_message = None;
+
+                        // Mode toggle works in both views.
+                        if let event::AppAction::ToggleMode = action {
+                            state.mode = match state.mode {
+                                app::AppMode::Disk => app::AppMode::Projects,
+                                app::AppMode::Projects => app::AppMode::Disk,
+                            };
+                            match state.mode {
+                                // Entering Projects mode: scan the directory
+                                // under the cursor (selected node), falling back
+                                // to the scan root when a file or nothing is
+                                // selected.
+                                app::AppMode::Projects if !state.projects_loading => {
+                                    let scan_target = state
+                                        .visible
+                                        .get(state.selected)
+                                        .filter(|&&idx| state.items[idx].has_children)
+                                        .map(|&idx| state.items[idx].full_path.clone())
+                                        .unwrap_or_else(|| state.root_path.clone());
+                                    state.projects_scan_root = scan_target.clone();
+                                    start_projects_scan(&project_tx, scan_target, state);
+                                }
+                                // Returning to Disk mode after a clean: the
+                                // cached tree is stale, so re-scan it.
+                                app::AppMode::Disk if state.disk_stale && !state.loading => {
+                                    state.disk_stale = false;
                                     start_shallow_scan(
                                         &scan_tx,
-                                        new_path,
+                                        state.root_path.clone(),
                                         state.apparent,
                                         state,
                                     );
                                 }
+                                _ => {}
                             }
-                            event::AppAction::ParentDir => {
-                                state.parent_dir();
-                                if let Some(new_path) = state.rescan_path.take() {
+                            continue;
+                        }
+
+                        match state.mode {
+                            app::AppMode::Disk => match action {
+                                event::AppAction::Quit => break,
+                                event::AppAction::Up => state.move_up(),
+                                event::AppAction::Down => state.move_down(),
+                                event::AppAction::Enter => state.enter(),
+                                event::AppAction::Back => state.back(),
+                                event::AppAction::Toggle => state.toggle_expand(),
+                                event::AppAction::JumpTop => state.jump_top(),
+                                event::AppAction::JumpBottom => state.jump_bottom(),
+                                event::AppAction::ToggleHidden => {
+                                    state.show_hidden = !state.show_hidden;
+                                    state.compute_visible();
+                                }
+                                event::AppAction::DeleteItem => {
+                                    state.request_delete();
+                                }
+                                event::AppAction::ToggleApparent => {
+                                    state.apparent = !state.apparent;
                                     start_shallow_scan(
                                         &scan_tx,
-                                        new_path,
+                                        state.root_path.clone(),
                                         state.apparent,
                                         state,
                                     );
                                 }
-                            }
+                                event::AppAction::StartSearch => {
+                                    state.search_active = true;
+                                    state.search_query.clear();
+                                }
+                                event::AppAction::EnterDir => {
+                                    state.enter_dir();
+                                    if let Some(new_path) = state.rescan_path.take() {
+                                        start_shallow_scan(
+                                            &scan_tx,
+                                            new_path,
+                                            state.apparent,
+                                            state,
+                                        );
+                                    }
+                                }
+                                event::AppAction::ParentDir => {
+                                    state.parent_dir();
+                                    if let Some(new_path) = state.rescan_path.take() {
+                                        start_shallow_scan(
+                                            &scan_tx,
+                                            new_path,
+                                            state.apparent,
+                                            state,
+                                        );
+                                    }
+                                }
+                                event::AppAction::Refresh => {
+                                    start_shallow_scan(
+                                        &scan_tx,
+                                        state.root_path.clone(),
+                                        state.apparent,
+                                        state,
+                                    );
+                                }
+                                _ => {}
+                            },
+                            app::AppMode::Projects => match action {
+                                event::AppAction::Quit => break,
+                                event::AppAction::Up => state.projects_up(),
+                                event::AppAction::Down => state.projects_down(),
+                                event::AppAction::JumpTop => state.projects_jump_top(),
+                                event::AppAction::JumpBottom => state.projects_jump_bottom(),
+                                event::AppAction::Enter | event::AppAction::CleanProject => {
+                                    state.request_clean();
+                                }
+                                event::AppAction::CleanAllProjects => state.request_clean_all(),
+                                event::AppAction::Refresh => {
+                                    let target = if state.projects_scan_root.is_empty() {
+                                        state.root_path.clone()
+                                    } else {
+                                        state.projects_scan_root.clone()
+                                    };
+                                    start_projects_scan(&project_tx, target, state);
+                                }
+                                _ => {}
+                            },
                         }
                     }
                 }
@@ -232,6 +383,94 @@ fn run_loop(terminal: &mut Tui, state: &mut app::AppState) -> Result<(), Box<dyn
         }
     }
     Ok(())
+}
+
+/// Start a background project scan with [`analyze`], collecting every project
+/// (with reclaimable size + type) found beneath `path`.
+fn start_projects_scan(
+    tx: &mpsc::Sender<ProjectScanResult>,
+    path: String,
+    state: &mut app::AppState,
+) {
+    state.projects_loading = true;
+    state.loading_frame = 0;
+    state.loading_message = format!("projects in {}", path);
+
+    let tx = tx.clone();
+    let path_owned = path;
+    std::thread::spawn(move || {
+        let opts = ScanOptions {
+            follow_symlinks: false,
+            same_file_system: false,
+        };
+        let entries: Vec<app::ProjectEntry> = analyze(&path_owned, &opts)
+            .map(|pa| app::ProjectEntry {
+                path: pa.project.path.to_string_lossy().into_owned(),
+                type_name: pa.project.type_name(),
+                reclaimable: pa.artifact_size,
+                last_modified: pa.last_modified,
+                artifact_dir_names: pa
+                    .project
+                    .artifact_dirs()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            })
+            .collect();
+        let _ = tx.send(ProjectScanResult {
+            entries,
+            errors: Vec::new(),
+        });
+    });
+}
+
+/// Clean every project in the current list, then re-scan the same root so the
+/// list reflects reality (partially-cleaned or permission-denied projects stay
+/// listed). Runs in the background; failures are surfaced via `error_message`.
+fn start_clean_all(tx: &mpsc::Sender<ProjectScanResult>, state: &mut app::AppState) {
+    let paths: Vec<String> = state.projects.iter().map(|e| e.path.clone()).collect();
+    let root_path = if state.projects_scan_root.is_empty() {
+        state.root_path.clone()
+    } else {
+        state.projects_scan_root.clone()
+    };
+    let count = paths.len();
+    state.projects_loading = true;
+    state.loading_frame = 0;
+    state.loading_message = format!("cleaning {} projects", count);
+    state.clean_all_pending = false;
+    state.disk_stale = true;
+
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let opts = ScanOptions {
+            follow_symlinks: false,
+            same_file_system: false,
+        };
+        let mut errors: Vec<String> = Vec::new();
+        for path in &paths {
+            if let Err(e) = crate::clean(std::path::Path::new(path)) {
+                errors.push(format!("{} ({})", path, e));
+            }
+        }
+        // Re-analyze the same root: successfully cleaned projects now have zero
+        // artifacts and drop out; failed ones remain with their sizes updated.
+        let entries: Vec<app::ProjectEntry> = analyze(&root_path, &opts)
+            .map(|pa| app::ProjectEntry {
+                path: pa.project.path.to_string_lossy().into_owned(),
+                type_name: pa.project.type_name(),
+                reclaimable: pa.artifact_size,
+                last_modified: pa.last_modified,
+                artifact_dir_names: pa
+                    .project
+                    .artifact_dirs()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            })
+            .collect();
+        let _ = tx.send(ProjectScanResult { entries, errors });
+    });
 }
 
 /// Start a background shallow scan (one level only).

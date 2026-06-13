@@ -1,6 +1,35 @@
 use std::collections::HashMap;
+use std::path::Path;
+use std::time::SystemTime;
 
-use crate::DiskItem;
+use crate::{dir_size, DiskItem, ScanOptions};
+
+/// Which view the TUI is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppMode {
+    /// WinDirStat-style directory tree with sizes.
+    Disk,
+    /// Kondo-style list of build projects and their reclaimable artifacts.
+    Projects,
+}
+
+/// One row of the Projects view: a discovered project plus the reclaimable
+/// total computed by [`analyze`](crate::analyze). The per-artifact-directory
+/// size breakdown is derived lazily (see [`AppState::project_detail_cloned`]).
+#[derive(Debug, Clone)]
+pub struct ProjectEntry {
+    /// Absolute path to the project root.
+    pub path: String,
+    /// Human-readable ecosystem label, e.g. `"Cargo / Node"`.
+    pub type_name: String,
+    /// Total reclaimable bytes across the project's artifact directories.
+    pub reclaimable: u64,
+    /// Most recent modification time across the project tree, if known.
+    pub last_modified: Option<SystemTime>,
+    /// Artifact-directory names for this project (without sizes); e.g.
+    /// `["target", "node_modules"]`. Sizes filled in on demand.
+    pub artifact_dir_names: Vec<String>,
+}
 
 /// A flattened node from the DiskItem tree, used for efficient rendering.
 pub struct FlatItem {
@@ -92,6 +121,47 @@ pub struct AppState {
     pub rescan_path: Option<String>,
     /// Cached detail stats for the selected item.
     cached_detail: Option<(usize, DetailStats)>, // (selected item idx, stats)
+
+    // ── Projects mode ───────────────────────────────────────────
+    /// Which view is active.
+    pub mode: AppMode,
+    /// True after a clean has deleted files on disk, meaning the cached disk
+    /// tree (`items`) no longer reflects reality. The disk view is re-scanned
+    /// when the user returns to it, so sizes stay consistent after cleaning.
+    pub disk_stale: bool,
+    /// The directory the current project list was scanned from (the selected
+    /// node's path when Projects mode was entered). Used both to re-scan after
+    /// a clean-all and to render project paths relative to it.
+    pub projects_scan_root: String,
+    /// Projects discovered by `analyze`, sorted by reclaimable size desc.
+    pub projects: Vec<ProjectEntry>,
+    /// Index of the selected project in `projects`.
+    pub projects_selected: usize,
+    /// Vertical scroll offset for the project list.
+    pub projects_scroll: usize,
+    /// Whether a project scan is running (blocks interaction except quit).
+    pub projects_loading: bool,
+    /// Pending clean target: Some(index into `projects`) when the clean
+    /// confirmation dialog is open.
+    pub clean_target: Option<usize>,
+    /// Snapshot of the clean target's per-artifact-directory breakdown,
+    /// captured when the confirmation dialog opens so the (immutable) render
+    /// path can display it without re-walking the tree.
+    pub clean_breakdown: Vec<(String, u64)>,
+    /// Whether the "clean ALL projects" confirmation dialog is open.
+    pub clean_all_pending: bool,
+    /// Cached per-artifact-directory breakdown for the selected project:
+    /// `(projects_selected, Vec<(name, size)>)`.
+    cached_project_detail: Option<(usize, Vec<(String, u64)>)>,
+}
+
+/// Default `ScanOptions` used by the Projects view (no symlink following,
+/// same-filesystem off — matching kondo's defaults).
+fn scan_opts() -> ScanOptions {
+    ScanOptions {
+        follow_symlinks: false,
+        same_file_system: false,
+    }
 }
 
 impl AppState {
@@ -127,6 +197,17 @@ impl AppState {
             cached_detail: None,
             delete_target: None,
             error_message: None,
+            mode: AppMode::Disk,
+            disk_stale: false,
+            projects_scan_root: String::new(),
+            projects: Vec::new(),
+            projects_selected: 0,
+            projects_scroll: 0,
+            projects_loading: false,
+            clean_target: None,
+            clean_breakdown: Vec::new(),
+            clean_all_pending: false,
+            cached_project_detail: None,
         };
         state.rebuild_from(root);
         state
@@ -153,6 +234,17 @@ impl AppState {
             cached_detail: None,
             delete_target: None,
             error_message: None,
+            mode: AppMode::Disk,
+            disk_stale: false,
+            projects_scan_root: String::new(),
+            projects: Vec::new(),
+            projects_selected: 0,
+            projects_scroll: 0,
+            projects_loading: false,
+            clean_target: None,
+            clean_breakdown: Vec::new(),
+            clean_all_pending: false,
+            cached_project_detail: None,
         }
     }
 
@@ -539,6 +631,218 @@ impl AppState {
             let item = &self.items[idx];
             (item.full_path.clone(), item.has_children)
         })
+    }
+
+    // ── Projects mode ────────────────────────────────────────────
+
+    /// Per-artifact-directory `(name, size)` breakdown for the selected
+    /// project, computed lazily and cached until the selection changes.
+    pub fn project_detail_cloned(&mut self) -> Vec<(String, u64)> {
+        if self.projects.is_empty() {
+            return Vec::new();
+        }
+        let idx = self.projects_selected;
+        if let Some((cached_idx, ref br)) = self.cached_project_detail {
+            if cached_idx == idx {
+                return br.clone();
+            }
+        }
+        let breakdown = compute_breakdown(&self.projects[idx]);
+        self.cached_project_detail = Some((idx, breakdown.clone()));
+        breakdown
+    }
+
+    /// Replace the project list (from a background scan), sorting by
+    /// reclaimable size descending and resetting selection/scroll/cache.
+    pub fn set_projects(&mut self, mut entries: Vec<ProjectEntry>) {
+        entries.sort_by(|a, b| b.reclaimable.cmp(&a.reclaimable));
+        self.projects = entries;
+        self.projects_selected = 0;
+        self.projects_scroll = 0;
+        self.cached_project_detail = None;
+    }
+
+    /// Largest reclaimable size among all projects — the scale for the list's
+    /// size bars. Returns 1 to avoid division by zero when the list is empty.
+    pub fn projects_max_reclaimable(&self) -> u64 {
+        self.projects
+            .iter()
+            .map(|e| e.reclaimable)
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// Total reclaimable bytes across every project — the summary figure shown
+    /// in the title bar and the clean-all dialog.
+    pub fn total_reclaimable(&self) -> u64 {
+        self.projects.iter().map(|e| e.reclaimable).sum()
+    }
+
+    /// Open the "clean all projects" confirmation dialog.
+    pub fn request_clean_all(&mut self) {
+        if !self.projects.is_empty() {
+            self.clean_all_pending = true;
+        }
+    }
+
+    pub fn cancel_clean_all(&mut self) {
+        self.clean_all_pending = false;
+    }
+
+    pub fn projects_up(&mut self) {
+        if self.projects_selected > 0 {
+            self.projects_selected -= 1;
+        }
+    }
+
+    pub fn projects_down(&mut self) {
+        if self.projects_selected + 1 < self.projects.len() {
+            self.projects_selected += 1;
+        }
+    }
+
+    pub fn projects_jump_top(&mut self) {
+        self.projects_selected = 0;
+    }
+
+    pub fn projects_jump_bottom(&mut self) {
+        if !self.projects.is_empty() {
+            self.projects_selected = self.projects.len() - 1;
+        }
+    }
+
+    /// Keep the selected project row within the viewport (mirrors
+    /// `adjust_scroll` for the disk tree).
+    pub fn projects_adjust_scroll(&mut self, viewport_height: usize) {
+        if viewport_height == 0 {
+            return;
+        }
+        if self.projects_selected < self.projects_scroll {
+            self.projects_scroll = self.projects_selected;
+        } else if self.projects_selected >= self.projects_scroll + viewport_height {
+            self.projects_scroll = self.projects_selected - viewport_height + 1;
+        }
+    }
+
+    /// Open the clean-confirmation dialog for the selected project, capturing
+    /// its artifact-directory breakdown for display.
+    pub fn request_clean(&mut self) {
+        if self.projects.is_empty() {
+            return;
+        }
+        let idx = self.projects_selected;
+        self.clean_breakdown = compute_breakdown(&self.projects[idx]);
+        self.clean_target = Some(idx);
+    }
+
+    pub fn cancel_clean(&mut self) {
+        self.clean_target = None;
+        self.clean_breakdown.clear();
+    }
+
+    /// Remove the cleaned project from the list (Kondo drops zero-artifact
+    /// projects) and reset dialog state. Called after a successful clean.
+    pub fn remove_cleaned_project(&mut self) {
+        let idx = self.clean_target.unwrap_or(self.projects_selected);
+        if idx < self.projects.len() {
+            self.projects.remove(idx);
+        }
+        self.cached_project_detail = None;
+        self.clean_target = None;
+        self.clean_breakdown.clear();
+        if !self.projects.is_empty() && self.projects_selected >= self.projects.len() {
+            self.projects_selected = self.projects.len() - 1;
+        }
+    }
+}
+
+/// Compute the non-empty `(name, size)` artifact-directory breakdown for a
+/// project, sorted largest first. Each directory is walked once via
+/// [`dir_size`](crate::dir_size); callers cache the result.
+fn compute_breakdown(entry: &ProjectEntry) -> Vec<(String, u64)> {
+    let opts = scan_opts();
+    let mut breakdown: Vec<(String, u64)> = entry
+        .artifact_dir_names
+        .iter()
+        .map(|d| {
+            let size = dir_size(&Path::new(&entry.path).join(d), &opts);
+            (d.clone(), size)
+        })
+        .filter(|(_, s)| *s > 0)
+        .collect();
+    breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+    breakdown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn entry(path: &str, reclaimable: u64) -> ProjectEntry {
+        ProjectEntry {
+            path: path.to_string(),
+            type_name: "Cargo".to_string(),
+            reclaimable,
+            last_modified: Some(SystemTime::UNIX_EPOCH),
+            artifact_dir_names: vec!["target".to_string()],
+        }
+    }
+
+    #[test]
+    fn set_projects_sorts_by_reclaimable_desc() {
+        let mut s = AppState::new_empty("/".into(), false);
+        s.set_projects(vec![entry("a", 100), entry("b", 500), entry("c", 300)]);
+        assert_eq!(s.projects.len(), 3);
+        assert_eq!(s.projects[0].path, "b"); // 500
+        assert_eq!(s.projects[1].path, "c"); // 300
+        assert_eq!(s.projects[2].path, "a"); // 100
+        assert_eq!(s.projects_selected, 0);
+    }
+
+    #[test]
+    fn remove_cleaned_project_removes_target_and_clamps_selection() {
+        let mut s = AppState::new_empty("/".into(), false);
+        s.set_projects(vec![entry("a", 100), entry("b", 500), entry("c", 300)]);
+        // After sort-desc the order is [b(500), c(300), a(100)].
+        assert_eq!(s.projects[1].path, "c");
+        s.projects_selected = 1; // select "c"
+        s.request_clean(); // clean_target = Some(1)
+        assert_eq!(s.clean_target, Some(1));
+        s.remove_cleaned_project();
+        assert!(!s.projects.iter().any(|e| e.path == "c"));
+        assert_eq!(s.projects.len(), 2);
+        assert_eq!(s.clean_target, None);
+        assert!(s.projects_selected < s.projects.len());
+    }
+
+    #[test]
+    fn projects_navigation_clamps_at_ends() {
+        let mut s = AppState::new_empty("/".into(), false);
+        s.set_projects(vec![entry("a", 1), entry("b", 2)]);
+        s.projects_jump_bottom();
+        assert_eq!(s.projects_selected, 1);
+        s.projects_down(); // already last
+        assert_eq!(s.projects_selected, 1);
+        s.projects_jump_top();
+        assert_eq!(s.projects_selected, 0);
+        s.projects_up(); // already first
+        assert_eq!(s.projects_selected, 0);
+    }
+
+    #[test]
+    fn projects_max_reclaimable_is_at_least_one() {
+        let s = AppState::new_empty("/".into(), false);
+        assert_eq!(s.projects_max_reclaimable(), 1); // empty list → guard
+    }
+
+    #[test]
+    fn total_reclaimable_sums_all_projects() {
+        let mut s = AppState::new_empty("/".into(), false);
+        assert_eq!(s.total_reclaimable(), 0); // empty
+        s.set_projects(vec![entry("a", 100), entry("b", 500), entry("c", 300)]);
+        assert_eq!(s.total_reclaimable(), 900);
     }
 }
 

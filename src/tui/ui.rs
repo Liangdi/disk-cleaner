@@ -1,4 +1,5 @@
 use std::sync::LazyLock;
+use std::time::SystemTime;
 
 use ratatui::{
     Frame,
@@ -9,7 +10,7 @@ use ratatui::{
 };
 use ratatui_style::{NodeRef, Stylesheet, css};
 
-use super::app::{AppState, DetailStats};
+use super::app::{AppState, AppMode, DetailStats, ProjectEntry};
 
 /// All styling for the interactive UI lives in this stylesheet, embedded at
 /// compile time. Re-theme the app by editing it.
@@ -27,8 +28,12 @@ fn sty(type_name: &str, classes: &[&str]) -> Style {
 const BAR_WIDTH: usize = 12;
 
 /// Render the full TUI layout.
-pub fn render(f: &mut Frame, state: &AppState, detail: &DetailStats) {
-    if state.loading {
+pub fn render(f: &mut Frame, state: &AppState, detail: &DetailStats, project_detail: &[(String, u64)]) {
+    let mode_loading = match state.mode {
+        AppMode::Disk => state.loading,
+        AppMode::Projects => state.projects_loading,
+    };
+    if mode_loading {
         render_loading(f, state);
         return;
     }
@@ -50,19 +55,33 @@ pub fn render(f: &mut Frame, state: &AppState, detail: &DetailStats) {
     // Left-right split for main area
     let main = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(55), // left: tree
-            Constraint::Percentage(45), // right: detail
-        ])
+        .constraints(match state.mode {
+            AppMode::Disk => [Constraint::Percentage(55), Constraint::Percentage(45)],
+            AppMode::Projects => [Constraint::Percentage(58), Constraint::Percentage(42)],
+        })
         .split(outer[1]);
 
-    render_list(f, state, main[0]);
-    render_detail(f, detail, main[1]);
+    match state.mode {
+        AppMode::Disk => {
+            render_list(f, state, main[0]);
+            render_detail(f, detail, main[1]);
+        }
+        AppMode::Projects => {
+            render_projects_list(f, state, main[0]);
+            render_projects_detail(f, state, project_detail, main[1]);
+        }
+    }
     render_status(f, state, outer[2]);
 
-    // Overlay: delete confirmation dialog
+    // Overlays: confirmation dialogs
     if state.delete_target.is_some() {
         render_delete_dialog(f, state);
+    }
+    if state.clean_target.is_some() {
+        render_clean_dialog(f, state);
+    }
+    if state.clean_all_pending {
+        render_clean_all_dialog(f, state);
     }
 }
 
@@ -93,6 +112,26 @@ fn render_title(f: &mut Frame, state: &AppState, area: Rect) {
         if state.search_active {
             spans.push(Span::styled("█", sty("Title", &["search"])));
         }
+    }
+
+    if state.mode == AppMode::Projects {
+        spans.push(Span::styled(
+            format!(
+                " ◈ projects:{} · {} reclaimable",
+                state.projects.len(),
+                pretty_bytes(state.total_reclaimable() as f64)
+            ),
+            sty("Title", &["apparent"]),
+        ));
+    }
+
+    // Transient error (e.g. failed clean/delete), shown until next keypress.
+    if let Some(err) = &state.error_message {
+        let w = area.width as usize;
+        spans.push(Span::styled(
+            format!(" ! {}", truncate_str(err, w.saturating_sub(40))),
+            Style::default().fg(Color::Rgb(255, 90, 90)),
+        ));
     }
 
     let para = Paragraph::new(Line::from(spans)).style(sty("Title", &[]));
@@ -437,6 +476,270 @@ fn render_top_largest(f: &mut Frame, stats: &DetailStats, area: Rect) {
     f.render_widget(para, area);
 }
 
+// ── Projects mode: list + detail ───────────────────────────
+
+/// Render the left-hand project list (Kondo-style).
+fn render_projects_list(f: &mut Frame, state: &AppState, area: Rect) {
+    if state.projects.is_empty() {
+        let para = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " ◈ No projects with reclaimable artifacts",
+                sty("Empty", &[]),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "   Build projects (Cargo, Node, Maven, …) found",
+                sty("Dim", &[]),
+            )),
+            Line::from(Span::styled(
+                "   beneath this path appear here.",
+                sty("Dim", &[]),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "   Press p / Tab to return to the disk view.",
+                sty("Dim", &[]),
+            )),
+        ])
+        .style(sty("TreePanel", &[]));
+        f.render_widget(para, area);
+        return;
+    }
+
+    let viewport_height = area.height as usize;
+    let max_reclaim = state.projects_max_reclaimable();
+    let lines: Vec<Line> = state
+        .projects
+        .iter()
+        .enumerate()
+        .skip(state.projects_scroll)
+        .take(viewport_height)
+        .map(|(i, e)| render_project_row(state, i, e, max_reclaim))
+        .collect();
+    let para = Paragraph::new(lines).style(sty("TreePanel", &[]));
+    f.render_widget(para, area);
+}
+
+fn render_project_row(
+    state: &AppState,
+    i: usize,
+    entry: &ProjectEntry,
+    max_reclaim: u64,
+) -> Line<'static> {
+    let is_selected = i == state.projects_selected;
+    let sel_cls: &[&str] = if is_selected { &["selected"] } else { &[] };
+    let row_bg = sty("TreeItem", sel_cls).bg.unwrap_or(Color::Reset);
+
+    let filled = if max_reclaim > 0 {
+        ((entry.reclaimable as f64 / max_reclaim as f64) * BAR_WIDTH as f64).round() as usize
+    } else {
+        0
+    };
+    let filled = filled.min(BAR_WIDTH);
+
+    // Threshold color by absolute reclaimable size (1G / 100M).
+    let pct_cls: &[&str] = if entry.reclaimable > 1_000_000_000 {
+        &["high"]
+    } else if entry.reclaimable > 100_000_000 {
+        &["mid"]
+    } else {
+        &["low"]
+    };
+    let bar_style = sty("Pct", pct_cls).bg(row_bg);
+
+    // Show the path relative to the directory Projects mode scanned from.
+    let base = if state.projects_scan_root.is_empty() {
+        state.root_path.as_str()
+    } else {
+        state.projects_scan_root.as_str()
+    };
+    let display_path: String = match entry.path.strip_prefix(base) {
+        Some(rest) => {
+            let r = rest.trim_start_matches('/');
+            if r.is_empty() {
+                entry.path.clone()
+            } else {
+                r.to_string()
+            }
+        }
+        None => entry.path.clone(),
+    };
+
+    Line::from(vec![
+        Span::styled(" ◈ ", sty("Indicator", sel_cls).bg(row_bg)),
+        Span::styled("█".repeat(filled), bar_style),
+        Span::styled(
+            "░".repeat(BAR_WIDTH.saturating_sub(filled)),
+            sty("Bar", &["empty"]).bg(row_bg),
+        ),
+        Span::styled(
+            format!(" {:>10}", pretty_bytes(entry.reclaimable as f64)),
+            sty("Size", &[]).bg(row_bg),
+        ),
+        Span::styled(
+            format!(" {} ", entry.type_name),
+            sty("TypeExt", &[]).bg(row_bg),
+        ),
+        Span::styled(display_path, sty("Name", &["dir"]).bg(row_bg)),
+    ])
+}
+
+/// Render the right-hand detail for the selected project.
+fn render_projects_detail(
+    f: &mut Frame,
+    state: &AppState,
+    breakdown: &[(String, u64)],
+    area: Rect,
+) {
+    let detail = THEME.compute(&NodeRef::new("DetailPanel"), None);
+    let block = detail.to_block();
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if state.projects.is_empty() {
+        let para = Paragraph::new(vec![
+            Line::from(Span::styled(" ◈ Projects", sty("SectionTitle", &[]))),
+            Line::from(""),
+            Line::from(Span::styled("  Nothing reclaimable found.", sty("Empty", &[]))),
+        ]);
+        f.render_widget(para, inner);
+        return;
+    }
+
+    let entry = &state.projects[state.projects_selected];
+    let w = inner.width as usize;
+    let total = entry.reclaimable;
+    let max_dir = breakdown.iter().map(|(_, s)| *s).max().unwrap_or(1).max(1);
+    let max_reclaim = state.projects_max_reclaimable();
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Type name
+    lines.push(Line::from(vec![
+        Span::styled(" ◈ ", sty("Largest", &[])),
+        Span::styled(entry.type_name.clone(), sty("SectionTitle", &[])),
+    ]));
+
+    // Path
+    lines.push(Line::from(vec![
+        Span::styled(" ", sty("Dim", &[])),
+        Span::styled(truncate_str(&entry.path, w.saturating_sub(2)), sty("Crumb", &[])),
+    ]));
+
+    // Reclaimable gauge, scaled against the largest project.
+    let gauge_w = w.saturating_sub(20);
+    let filled = if max_reclaim > 0 && gauge_w > 0 {
+        ((total as f64 / max_reclaim as f64) * gauge_w as f64).round() as usize
+    } else {
+        0
+    };
+    let filled = filled.min(gauge_w);
+    let gauge_cls: &[&str] = if total > 1_000_000_000 {
+        &["high"]
+    } else if total > 100_000_000 {
+        &["mid"]
+    } else {
+        &["low"]
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" ╺", sty("GaugeCap", &[])),
+        Span::styled("━".repeat(filled), sty("Gauge", gauge_cls)),
+        Span::styled(
+            "─".repeat(gauge_w.saturating_sub(filled)),
+            sty("GaugeTrack", &[]),
+        ),
+        Span::styled("╸ ", sty("GaugeCap", &[])),
+        Span::styled(
+            pretty_bytes(total as f64),
+            sty("Gauge", gauge_cls).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Last modified
+    if let Some(mtime) = entry.last_modified {
+        lines.push(Line::from(vec![
+            Span::styled(" ", sty("Dim", &[])),
+            Span::styled(
+                format!("modified {}", relative_time(mtime)),
+                sty("Dim", &[]),
+            ),
+        ]));
+    }
+
+    // Separator
+    lines.push(Line::from(Span::styled(
+        format!(" {}", "─".repeat(w.saturating_sub(2))),
+        sty("Hr", &[]),
+    )));
+
+    // Artifact-directory breakdown
+    lines.push(Line::from(Span::styled(
+        " ◈ Artifact dirs",
+        sty("SectionTitle", &["amber"]),
+    )));
+    if breakdown.is_empty() {
+        lines.push(Line::from(Span::styled("  (none)", sty("Empty", &[]))));
+    } else {
+        let bar_w = 8;
+        for (name, size) in breakdown.iter().take(8) {
+            let filled = if max_dir > 0 {
+                ((*size as f64 / max_dir as f64) * bar_w as f64).round() as usize
+            } else {
+                0
+            };
+            let filled = filled.min(bar_w);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:<16}", truncate_str(name, 16)),
+                    sty("TypeExt", &[]),
+                ),
+                Span::styled("█".repeat(filled), sty("TypeExt", &[])),
+                Span::styled(
+                    "░".repeat(bar_w.saturating_sub(filled)),
+                    sty("Bar", &["empty"]),
+                ),
+                Span::styled(
+                    format!(" {:>9}", pretty_bytes(*size as f64)),
+                    sty("TypeSize", &[]),
+                ),
+                Span::styled(" ⟳", sty("Largest", &[])),
+            ]));
+        }
+    }
+
+    // Clean hint
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" [", sty("DialogKey", &[])),
+        Span::styled("c", sty("DialogConfirm", &[])),
+        Span::styled("] clean ", sty("DialogKey", &[])),
+        Span::styled(pretty_bytes(total as f64), sty("StatSize", &[])),
+        Span::styled(" reclaimable", sty("Dim", &[])),
+    ]));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Format a `SystemTime` as a coarse relative age (e.g. "3h ago").
+fn relative_time(t: SystemTime) -> String {
+    match SystemTime::now().duration_since(t) {
+        Ok(d) => {
+            let s = d.as_secs();
+            if s < 60 {
+                format!("{}s ago", s)
+            } else if s < 3600 {
+                format!("{}m ago", s / 60)
+            } else if s < 86400 {
+                format!("{}h ago", s / 3600)
+            } else {
+                format!("{}d ago", s / 86400)
+            }
+        }
+        Err(_) => "just now".to_string(),
+    }
+}
+
 // ── Delete confirmation dialog (HUD style) ──────────────────
 
 fn render_delete_dialog(f: &mut Frame, state: &AppState) {
@@ -519,6 +822,195 @@ fn render_delete_dialog(f: &mut Frame, state: &AppState) {
     f.render_widget(para, area);
 }
 
+// ── Clean confirmation dialog (projects mode) ──────────────
+
+/// Outer width (in cells) of the clean-project dialog box.
+const CLEAN_DIALOG_W: usize = 58;
+
+/// Render the HUD-style confirmation for cleaning a project's artifacts.
+fn render_clean_dialog(f: &mut Frame, state: &AppState) {
+    let idx = match state.clean_target {
+        Some(i) => i,
+        None => return,
+    };
+    let entry = match state.projects.get(idx) {
+        Some(e) => e,
+        None => return,
+    };
+    let total = pretty_bytes(entry.reclaimable as f64);
+    let inner_w = CLEAN_DIALOG_W.saturating_sub(2);
+
+    // Show up to 5 artifact dirs, summarize the rest.
+    let shown: Vec<&(String, u64)> = state.clean_breakdown.iter().take(5).collect();
+    let extra = state.clean_breakdown.len().saturating_sub(shown.len());
+
+    let title = " CLEAN PROJECT ";
+    let mut text: Vec<Line> = Vec::new();
+
+    // Top border + title
+    text.push(Line::from(vec![
+        Span::styled("╔", sty("DialogBorder", &[])),
+        Span::styled(title, sty("DialogTitle", &[])),
+        Span::styled(
+            "═".repeat(CLEAN_DIALOG_W.saturating_sub(2).saturating_sub(title.chars().count())),
+            sty("DialogBorder", &[]),
+        ),
+        Span::styled("╗", sty("DialogBorder", &[])),
+    ]));
+
+    text.push(boxed_line(
+        &format!("▸ {}", entry.type_name),
+        inner_w,
+        sty("DialogTarget", &[]),
+    ));
+    text.push(boxed_line(
+        &format!("  {}", truncate_str(&entry.path, inner_w.saturating_sub(2))),
+        inner_w,
+        sty("DialogName", &[]),
+    ));
+    text.push(boxed_line("", inner_w, sty("DialogDivider", &[])));
+
+    for (name, size) in &shown {
+        text.push(boxed_line(
+            &format!(
+                "  {:<14} {:>9}",
+                truncate_str(name, 14),
+                pretty_bytes(*size as f64)
+            ),
+            inner_w,
+            sty("DialogName", &[]),
+        ));
+    }
+    if extra > 0 {
+        text.push(boxed_line(
+            &format!("  +{} more", extra),
+            inner_w,
+            sty("Dim", &[]),
+        ));
+    }
+
+    text.push(boxed_line(
+        &format!(
+            "⚠  Remove {} dir(s) — {}. Cannot be undone.",
+            state.clean_breakdown.len(),
+            total
+        ),
+        inner_w,
+        sty("DialogWarn", &[]),
+    ));
+
+    // Bottom border
+    text.push(Line::from(vec![
+        Span::styled("╚", sty("DialogBorder", &[])),
+        Span::styled("═".repeat(inner_w), sty("DialogBorder", &[])),
+        Span::styled("╝", sty("DialogBorder", &[])),
+    ]));
+
+    // Prompt below the box
+    text.push(Line::from(vec![
+        Span::styled("  [", sty("DialogKey", &[])),
+        Span::styled("y", sty("DialogConfirm", &[])),
+        Span::styled("] confirm   [", sty("DialogKey", &[])),
+        Span::styled("n/Esc", sty("DialogAbort", &[])),
+        Span::styled("] abort", sty("DialogKey", &[])),
+    ]));
+
+    let area = centered_rect(CLEAN_DIALOG_W, text.len(), f.area());
+    f.render_widget(Clear, area);
+    let para = Paragraph::new(text).style(sty("Dialog", &[]));
+    f.render_widget(para, area);
+}
+
+/// Confirmation HUD for cleaning ALL projects at once.
+fn render_clean_all_dialog(f: &mut Frame, state: &AppState) {
+    if state.projects.is_empty() {
+        return;
+    }
+    let n = state.projects.len();
+    let total = pretty_bytes(state.total_reclaimable() as f64);
+    let inner_w = CLEAN_DIALOG_W.saturating_sub(2);
+
+    // Distinct artifact-dir names across all projects, for a preview.
+    let mut dirs: Vec<&str> = Vec::new();
+    for e in &state.projects {
+        for d in &e.artifact_dir_names {
+            if !dirs.contains(&d.as_str()) {
+                dirs.push(d.as_str());
+            }
+        }
+    }
+    let extra_dirs = dirs.len().saturating_sub(5);
+    let dir_preview = dirs.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+
+    let title = " CLEAN ALL PROJECTS ";
+    let mut text: Vec<Line> = Vec::new();
+
+    text.push(Line::from(vec![
+        Span::styled("╔", sty("DialogBorder", &[])),
+        Span::styled(title, sty("DialogTitle", &[])),
+        Span::styled(
+            "═".repeat(
+                CLEAN_DIALOG_W
+                    .saturating_sub(2)
+                    .saturating_sub(title.chars().count()),
+            ),
+            sty("DialogBorder", &[]),
+        ),
+        Span::styled("╗", sty("DialogBorder", &[])),
+    ]));
+
+    text.push(boxed_line(
+        &format!("▸ {} projects", n),
+        inner_w,
+        sty("DialogTarget", &[]),
+    ));
+    text.push(boxed_line(
+        &format!("  Reclaims {} total", total),
+        inner_w,
+        sty("StatSize", &[]),
+    ));
+    text.push(boxed_line("", inner_w, sty("DialogDivider", &[])));
+    let preview = if extra_dirs > 0 {
+        format!("  removes: {}… (+{} more)", dir_preview, extra_dirs)
+    } else {
+        format!("  removes: {}", dir_preview)
+    };
+    text.push(boxed_line(&preview, inner_w, sty("DialogName", &[])));
+    text.push(boxed_line(
+        "⚠  Cannot be undone.",
+        inner_w,
+        sty("DialogWarn", &[]),
+    ));
+
+    text.push(Line::from(vec![
+        Span::styled("╚", sty("DialogBorder", &[])),
+        Span::styled("═".repeat(inner_w), sty("DialogBorder", &[])),
+        Span::styled("╝", sty("DialogBorder", &[])),
+    ]));
+    text.push(Line::from(vec![
+        Span::styled("  [", sty("DialogKey", &[])),
+        Span::styled("y", sty("DialogConfirm", &[])),
+        Span::styled("] confirm   [", sty("DialogKey", &[])),
+        Span::styled("n/Esc", sty("DialogAbort", &[])),
+        Span::styled("] abort", sty("DialogKey", &[])),
+    ]));
+
+    let area = centered_rect(CLEAN_DIALOG_W, text.len(), f.area());
+    f.render_widget(Clear, area);
+    let para = Paragraph::new(text).style(sty("Dialog", &[]));
+    f.render_widget(para, area);
+}
+
+/// One row of the clean dialog: `║<content padded to inner_w>║`.
+fn boxed_line(content: &str, inner_w: usize, style: Style) -> Line<'static> {
+    let content = truncate_str(content, inner_w);
+    Line::from(vec![
+        Span::styled("║", sty("DialogDivider", &[])),
+        Span::styled(format!("{:<width$}", content, width = inner_w), style),
+        Span::styled("║", sty("DialogDivider", &[])),
+    ])
+}
+
 /// Return a centered Rect of the given width/height within `r`.
 fn centered_rect(width: usize, height: usize, r: Rect) -> Rect {
     let x = (r.width as usize).saturating_sub(width) / 2;
@@ -534,30 +1026,45 @@ fn centered_rect(width: usize, height: usize, r: Rect) -> Rect {
 // ── Status bar ─────────────────────────────────────────────
 
 fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let hidden_cls: &[&str] = if state.show_hidden { &["on"] } else { &[] };
-    let status = Line::from(vec![
+    let count = match state.mode {
+        AppMode::Disk => state.visible.len(),
+        AppMode::Projects => state.projects.len(),
+    };
+
+    // Each hint is a bright key followed by a dim label, pushed into one line.
+    let mut spans: Vec<Span> = vec![
         Span::styled(" ▌", sty("StatusGlyph", &[])),
-        Span::styled(
-            format!("{}", state.visible.len()),
-            sty("StatusCount", &[]),
-        ),
+        Span::styled(format!("{}", count), sty("StatusCount", &[])),
         Span::styled("▐ ", sty("StatusGlyph", &[])),
-        Span::styled("q", sty("StatusKey", &[])),
-        Span::styled("uit ", sty("StatusHint", &[])),
-        Span::styled("/", sty("StatusKey", &[])),
-        Span::styled("find ", sty("StatusHint", &[])),
-        Span::styled(".", sty("StatusHidden", hidden_cls)),
-        Span::styled("hide ", sty("StatusHint", &[])),
-        Span::styled("x", sty("StatusKey", &[])),
-        Span::styled("del ", sty("StatusHint", &[])),
-        Span::styled("a", sty("StatusKey", &[])),
-        Span::styled("size ", sty("StatusHint", &[])),
-        Span::styled("d", sty("StatusKey", &[])),
-        Span::styled("cd ", sty("StatusHint", &[])),
-        Span::styled("u", sty("StatusKey", &[])),
-        Span::styled("up", sty("StatusHint", &[])),
-    ]);
-    let para = Paragraph::new(status).style(sty("Status", &[]));
+    ];
+
+    let hints: &[(&str, &str)] = match state.mode {
+        AppMode::Disk => &[
+            ("p", "roj "),
+            ("/", "find "),
+            ("x", "del "),
+            ("a", "size "),
+            ("d", "cd "),
+            ("u", "up "),
+            ("r", "efresh "),
+            ("q", "uit"),
+        ],
+        AppMode::Projects => &[
+            ("p", "disk "),
+            ("c", "lean "),
+            ("C", "lean-all "),
+            ("j/k", "move "),
+            ("g/G", "top/bot "),
+            ("r", "efresh "),
+            ("q", "uit"),
+        ],
+    };
+    for (key, label) in hints {
+        spans.push(Span::styled(*key, sty("StatusKey", &[])));
+        spans.push(Span::styled(*label, sty("StatusHint", &[])));
+    }
+
+    let para = Paragraph::new(Line::from(spans)).style(sty("Status", &[]));
     f.render_widget(para, area);
 }
 
@@ -839,7 +1346,9 @@ mod tests {
 
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &state, &detail)).unwrap();
+        terminal
+            .draw(|f| render(f, &state, &detail, &[]))
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
