@@ -198,8 +198,18 @@ impl DisplayInfo {
     /// Ascend back to parent (undo push).
     fn pop(&mut self) {
         self.level -= 1;
-        // Remove "  " + indent char (3 chars)
-        self.indents.truncate(self.indents.len().saturating_sub(3));
+        // Undo one push: indent char + "  " = 3 chars. Drop by *character* count,
+        // not bytes — shape::INDENT ("│") is multibyte (3 bytes), so a byte-based
+        // `truncate(len - 3)` can land mid-character and panic on `is_char_boundary`.
+        let mut new_len = self.indents.len();
+        for _ in 0..3 {
+            new_len = self.indents[..new_len]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+        self.indents.truncate(new_len);
     }
 
     fn prefix(&self) -> &'static str {
@@ -259,5 +269,46 @@ fn parse_percent(src: &str) -> Result<f64, Box<dyn Error + Send + Sync>> {
         Ok(num)
     } else {
         Err("Percentage must be in range [0, 100].".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item() -> DiskItem {
+        DiskItem {
+            name: "x".into(),
+            disk_size: 1,
+            children: None,
+        }
+    }
+
+    /// Regression: `pop()` must remove whole characters, not bytes. With the
+    /// multibyte `shape::INDENT` ("│"), the old byte-based `truncate(len - 3)`
+    /// landed mid-character and panicked on `is_char_boundary`.
+    #[test]
+    fn push_pop_roundtrip_with_multibyte_indent() {
+        let mut info = DisplayInfo::new();
+
+        // From the root (last=true), descend through non-last siblings.
+        // push #1 adds "   " (spaces); #2 and #3 add "│  " (multibyte).
+        info.push(&item(), 10.0, false);
+        info.push(&item(), 20.0, false);
+        info.push(&item(), 30.0, false);
+        assert_eq!(info.level, 3);
+        assert_eq!(info.indents, "   │  │  ");
+        assert_eq!(info.indents.chars().count(), 9); // 3 levels × 3 chars
+
+        // Partial pop keeps the lower levels intact (no mid-char truncation).
+        info.pop();
+        assert_eq!(info.indents, "   │  ");
+        assert_eq!(info.level, 2);
+
+        // Pop back to root must not panic and must clear indents fully.
+        info.pop();
+        info.pop();
+        assert_eq!(info.level, 0);
+        assert!(info.indents.is_empty(), "indents not fully popped: {:?}", info.indents);
     }
 }
