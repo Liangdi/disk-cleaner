@@ -1,0 +1,150 @@
+/*
+ * disk-cleaner — sci-fi HUD theme.
+ *
+ * Loaded at compile time via `ratatui_style::css!("theme.css")` (see ui.rs).
+ * Every styled span in the interactive UI resolves to a type selector here,
+ * with variant classes for dynamic state (selection, percentage thresholds,
+ * on/off toggles). Editing this file is the way to re-theme the app.
+ *
+ * NOTE: the loading splash is a procedural per-frame animation and is NOT
+ * styled from here — see render_loading / make_* in ui.rs.
+ */
+
+:root {
+    /* backgrounds */
+    --bg-deep:   #080a12;
+    --bg-panel:  #0c0f19;
+    --sel-bg:    #002332;
+    --bar-empty: #121623;
+    --gauge-bg:  #141928;
+
+    /* borders */
+    --border-dim:    #003237;
+    --border-bright: #007878;
+
+    /* accents */
+    --accent-cyan: #00d2d2;
+    --accent-glow: #50ffff;
+
+    /* text */
+    --text-dim:    #374155;
+    --text-mid:    #8c96aa;
+    --text-bright: #c8d2e1;
+
+    /* signal colors */
+    --amber:      #ffc33c;
+    --amber-dim:  #a07828;
+    --purple:     #aa50ff;
+    --purple-dim: #502878;
+    --red:        #ff4646;
+    --green:      #3ce682;
+
+    /* inline one-offs (previously hardcoded in spans) */
+    --rootpath:       #50bebe;
+    --dir-cyan:       #00bebe;
+    --dialog-divider: #781e1e;
+    --dialog-bg:      #140408;
+}
+
+/* ── Root clear ─────────────────────────────────────────── */
+Root { background: var(--bg-deep); }
+
+/* ── Title bar ──────────────────────────────────────────── */
+Title          { background: var(--bg-deep); }
+Title.glyph    { color: var(--accent-glow); }
+Title.name     { color: var(--accent-cyan); font-weight: bold; }
+Title.rootpath { color: var(--rootpath); }
+Title.total    { color: var(--amber); font-weight: bold; }
+Title.apparent { color: var(--purple); }
+Title.search   { color: var(--green); }
+
+/* ── Tree list (left panel) ─────────────────────────────── */
+TreePanel         { background: var(--bg-panel); }
+
+/* Row background — computed once per row and patched onto each span. */
+TreeItem            { background: var(--bg-panel); }
+TreeItem.selected   { background: var(--sel-bg); }
+
+Indicator            { color: var(--accent-cyan); }
+Indicator.selected   { color: var(--accent-glow); }
+
+/* Percentage text + filled bar share the same color (no bold). */
+Pct        { color: var(--accent-cyan); }
+Pct.root   { color: var(--green); }
+Pct.high   { color: var(--red); }
+Pct.mid    { color: var(--amber); }
+Pct.low    { color: var(--accent-cyan); }
+
+Bar.empty  { color: var(--bar-empty); }
+
+Size       { color: var(--amber-dim); }
+
+Name            { color: var(--text-bright); }
+Name.dir        { color: var(--dir-cyan); }
+Name.selected   { color: var(--accent-glow); font-weight: bold; }
+
+/* ── Detail panel (right) ───────────────────────────────── */
+/* NOTE: ratatui-style 0.1.1 does not resolve var() inside border colors, so
+ * the border color uses the literal hex (== --border-dim) rather than the
+ * token. The value stays in sync with --border-dim above. */
+DetailPanel { border-left: single #003237; background: var(--bg-panel); }
+
+Crumb       { color: var(--accent-cyan); font-weight: bold; }
+
+/* Proportion gauge — bar has color only; the % label adds bold in code. */
+Gauge       { color: var(--accent-cyan); }
+Gauge.high  { color: var(--red); }
+Gauge.mid   { color: var(--amber); }
+Gauge.low   { color: var(--accent-cyan); }
+GaugeTrack  { color: var(--gauge-bg); }
+GaugeCap    { color: var(--border-bright); }
+
+Sep         { color: var(--border-dim); }
+StatSize    { color: var(--amber); font-weight: bold; }
+StatLabel   { color: var(--text-mid); }
+
+Largest     { color: var(--red); }
+LargestName { color: var(--text-bright); }
+Hr          { color: var(--border-dim); }
+
+/* Generic dim text: leading spaces, "avg …", counts, ranks, empty hints. */
+Dim         { color: var(--text-dim); }
+
+SectionTitle        { color: var(--accent-cyan); font-weight: bold; }
+SectionTitle.purple { color: var(--purple); }
+SectionTitle.amber  { color: var(--amber); }
+Empty               { color: var(--text-dim); }
+
+/* Type distribution rows. */
+TypeExt     { color: var(--accent-cyan); }
+TypeSize    { color: var(--text-bright); }
+
+/* Size histogram rows. */
+HistLabel   { color: var(--purple); }
+HistEmpty   { color: var(--purple-dim); }
+HistSize    { color: var(--text-bright); }
+
+/* Top largest rows. */
+TopSize     { color: var(--amber); }
+TopName     { color: var(--text-bright); }
+
+/* ── Status bar ─────────────────────────────────────────── */
+Status          { background: var(--bg-deep); }
+StatusGlyph     { color: var(--border-bright); }
+StatusCount     { color: var(--accent-glow); font-weight: bold; }
+StatusKey       { color: var(--accent-cyan); font-weight: bold; }
+StatusHint      { color: var(--text-dim); }
+StatusHidden    { color: var(--text-dim); font-weight: bold; }
+StatusHidden.on { color: var(--green); }
+
+/* ── Delete confirmation dialog ─────────────────────────── */
+Dialog         { background: var(--dialog-bg); }
+DialogBorder   { color: var(--red); }
+DialogTitle    { color: var(--red); font-weight: bold; }
+DialogDivider  { color: var(--dialog-divider); }
+DialogTarget   { color: var(--red); }
+DialogName     { color: var(--accent-glow); font-weight: bold; }
+DialogWarn     { color: yellow; }
+DialogKey      { color: var(--text-dim); }
+DialogConfirm  { color: var(--green); font-weight: bold; }
+DialogAbort    { color: var(--red); font-weight: bold; }

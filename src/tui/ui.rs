@@ -1,35 +1,30 @@
+use std::sync::LazyLock;
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
+use ratatui_style::{NodeRef, Stylesheet, css};
 
 use super::app::{AppState, DetailStats};
 
+/// All styling for the interactive UI lives in this stylesheet, embedded at
+/// compile time. Re-theme the app by editing it.
+static THEME: LazyLock<Stylesheet> = css!("theme.css");
+
+/// Compute the ratatui [`Style`] for a styled element (`Type` selector) with
+/// optional variant classes. The common no-parent case.
+fn sty(type_name: &str, classes: &[&str]) -> Style {
+    THEME
+        .compute(&NodeRef::new(type_name).classes(classes), None)
+        .to_style()
+}
+
 /// Width of the percentage bar in characters.
 const BAR_WIDTH: usize = 12;
-
-// ── Sci-fi color palette ────────────────────────────────────
-const BG_DEEP: Color = Color::Rgb(8, 10, 18);
-const BG_PANEL: Color = Color::Rgb(12, 15, 25);
-const BORDER_DIM: Color = Color::Rgb(0, 50, 55);
-const BORDER_BRIGHT: Color = Color::Rgb(0, 120, 120);
-const ACCENT_CYAN: Color = Color::Rgb(0, 210, 210);
-const ACCENT_GLOW: Color = Color::Rgb(80, 255, 255);
-const TEXT_DIM: Color = Color::Rgb(55, 65, 85);
-const TEXT_MID: Color = Color::Rgb(140, 150, 170);
-const TEXT_BRIGHT: Color = Color::Rgb(200, 210, 225);
-const AMBER: Color = Color::Rgb(255, 195, 60);
-const AMBER_DIM: Color = Color::Rgb(160, 120, 40);
-const PURPLE: Color = Color::Rgb(170, 80, 255);
-const PURPLE_DIM: Color = Color::Rgb(80, 40, 120);
-const RED_ACCENT: Color = Color::Rgb(255, 70, 70);
-const GREEN_ACCENT: Color = Color::Rgb(60, 230, 130);
-const SEL_BG: Color = Color::Rgb(0, 35, 50);
-const BAR_EMPTY: Color = Color::Rgb(18, 22, 35);
-const GAUGE_BG: Color = Color::Rgb(20, 25, 40);
 
 /// Render the full TUI layout.
 pub fn render(f: &mut Frame, state: &AppState, detail: &DetailStats) {
@@ -39,10 +34,7 @@ pub fn render(f: &mut Frame, state: &AppState, detail: &DetailStats) {
     }
 
     // Clear entire frame to deep background
-    f.render_widget(
-        Paragraph::new("").style(Style::default().bg(BG_DEEP)),
-        f.area(),
-    );
+    f.render_widget(Paragraph::new("").style(sty("Root", &[])), f.area());
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -79,50 +71,31 @@ pub fn render(f: &mut Frame, state: &AppState, detail: &DetailStats) {
 fn render_title(f: &mut Frame, state: &AppState, area: Rect) {
     let total = pretty_bytes(state.total_size as f64);
     let mut spans = vec![
-        Span::styled(
-            " ▌",
-            Style::default().fg(ACCENT_GLOW),
-        ),
-        Span::styled(
-            "disk cleaner",
-            Style::default()
-                .fg(ACCENT_CYAN)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " ▐ ",
-            Style::default().fg(ACCENT_GLOW),
-        ),
+        Span::styled(" ▌", sty("Title", &["glyph"])),
+        Span::styled("disk cleaner", sty("Title", &["name"])),
+        Span::styled(" ▐ ", sty("Title", &["glyph"])),
         Span::styled(
             format!("{} ", state.root_path),
-            Style::default().fg(Color::Rgb(80, 190, 190)),
+            sty("Title", &["rootpath"]),
         ),
-        Span::styled(
-            format!("{}", total),
-            Style::default()
-                .fg(AMBER)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("{}", total), sty("Title", &["total"])),
     ];
 
     if state.apparent {
-        spans.push(Span::styled(
-            " [apparent]",
-            Style::default().fg(PURPLE),
-        ));
+        spans.push(Span::styled(" [apparent]", sty("Title", &["apparent"])));
     }
 
     if !state.search_query.is_empty() || state.search_active {
         spans.push(Span::styled(
             format!(" /{}", state.search_query),
-            Style::default().fg(GREEN_ACCENT),
+            sty("Title", &["search"]),
         ));
         if state.search_active {
-            spans.push(Span::styled("█", Style::default().fg(GREEN_ACCENT)));
+            spans.push(Span::styled("█", sty("Title", &["search"])));
         }
     }
 
-    let para = Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_DEEP));
+    let para = Paragraph::new(Line::from(spans)).style(sty("Title", &[]));
     f.render_widget(para, area);
 }
 
@@ -139,7 +112,7 @@ fn render_list(f: &mut Frame, state: &AppState, area: Rect) {
         .map(|(vis_idx, &item_idx)| render_item(state, vis_idx, item_idx))
         .collect();
 
-    let para = Paragraph::new(lines).style(Style::default().bg(BG_PANEL));
+    let para = Paragraph::new(lines).style(sty("TreePanel", &[]));
     f.render_widget(para, area);
 }
 
@@ -171,15 +144,17 @@ fn render_item(state: &AppState, vis_idx: usize, item_idx: usize) -> Line<'stati
     };
     let filled = filled.min(BAR_WIDTH);
 
-    let pct_color = if item.depth == 0 {
-        GREEN_ACCENT
+    // Threshold-driven color, shared by the % text and the filled bar.
+    let pct_cls: &[&str] = if item.depth == 0 {
+        &["root"]
     } else if pct > 20.0 {
-        RED_ACCENT
+        &["high"]
     } else if pct > 10.0 {
-        AMBER
+        &["mid"]
     } else {
-        ACCENT_CYAN
+        &["low"]
     };
+    let pct_style = sty("Pct", pct_cls);
 
     let size_str = pretty_bytes(item.disk_size as f64);
     let name = if item.has_children {
@@ -188,55 +163,45 @@ fn render_item(state: &AppState, vis_idx: usize, item_idx: usize) -> Line<'stati
         item.name.clone()
     };
 
-    let name_color = if is_selected {
-        ACCENT_GLOW
+    let name_cls: &[&str] = if is_selected {
+        &["selected"]
     } else if item.has_children {
-        Color::Rgb(0, 190, 190)
+        &["dir"]
     } else {
-        TEXT_BRIGHT
+        &[]
     };
+    let ind_cls: &[&str] = if is_selected { &["selected"] } else { &[] };
+    let sel_cls: &[&str] = if is_selected { &["selected"] } else { &[] };
 
-    let indicator_color = if is_selected { ACCENT_GLOW } else { ACCENT_CYAN };
-
-    let sel_bg = if is_selected { SEL_BG } else { BG_PANEL };
+    // Row background (CSS guarantees TreeItem declares a background).
+    let row_bg = sty("TreeItem", sel_cls).bg.unwrap_or(Color::Reset);
 
     Line::from(vec![
         Span::styled(
             format!("{}{}", indent, indicator),
-            Style::default().fg(indicator_color).bg(sel_bg),
+            sty("Indicator", ind_cls).bg(row_bg),
         ),
-        Span::styled(
-            format!("{:>6.1}% ", pct),
-            Style::default().fg(pct_color).bg(sel_bg),
-        ),
-        Span::styled(
-            "█".repeat(filled),
-            Style::default().fg(pct_color).bg(sel_bg),
-        ),
+        Span::styled(format!("{:>6.1}% ", pct), pct_style.bg(row_bg)),
+        Span::styled("█".repeat(filled), pct_style.bg(row_bg)),
         Span::styled(
             "░".repeat(BAR_WIDTH - filled),
-            Style::default().fg(BAR_EMPTY).bg(sel_bg),
+            sty("Bar", &["empty"]).bg(row_bg),
         ),
         Span::styled(
             format!(" {:>10}", size_str),
-            Style::default().fg(AMBER_DIM).bg(sel_bg),
+            sty("Size", &[]).bg(row_bg),
         ),
-        Span::styled(
-            format!(" {}", name),
-            Style::default().fg(name_color).bg(sel_bg).add_modifier(
-                if is_selected { Modifier::BOLD } else { Modifier::empty() },
-            ),
-        ),
+        Span::styled(format!(" {}", name), sty("Name", name_cls).bg(row_bg)),
     ])
 }
 
 // ── Right: Detail panel ────────────────────────────────────
 
 fn render_detail(f: &mut Frame, stats: &DetailStats, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(BORDER_DIM))
-        .style(Style::default().bg(BG_PANEL));
+    // CSS `border-left: single var(--border-dim)` yields exactly the LEFT border.
+    // Bind the computed style: `to_block()` borrows it.
+    let detail = THEME.compute(&NodeRef::new("DetailPanel"), None);
+    let block = detail.to_block();
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -272,13 +237,8 @@ fn render_header_section(f: &mut Frame, stats: &DetailStats, area: Rect) {
             .join(" ▸ ")
     };
     lines.push(Line::from(vec![
-        Span::styled(" ", Style::default().fg(TEXT_DIM)),
-        Span::styled(
-            truncate_str(&crumb, w.saturating_sub(2)),
-            Style::default()
-                .fg(ACCENT_CYAN)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(" ", sty("Dim", &[])),
+        Span::styled(truncate_str(&crumb, w.saturating_sub(2)), sty("Crumb", &[])),
     ]));
 
     // Proportion gauge: big visual bar of total share
@@ -289,29 +249,24 @@ fn render_header_section(f: &mut Frame, stats: &DetailStats, area: Rect) {
         0
     };
     let filled = filled.min(gauge_w);
-    let gauge_color = if stats.pct_of_total > 50.0 {
-        RED_ACCENT
+    let gauge_cls: &[&str] = if stats.pct_of_total > 50.0 {
+        &["high"]
     } else if stats.pct_of_total > 20.0 {
-        AMBER
+        &["mid"]
     } else {
-        ACCENT_CYAN
+        &["low"]
     };
     lines.push(Line::from(vec![
-        Span::styled(" ╺", Style::default().fg(BORDER_BRIGHT)),
-        Span::styled(
-            "━".repeat(filled),
-            Style::default().fg(gauge_color),
-        ),
+        Span::styled(" ╺", sty("GaugeCap", &[])),
+        Span::styled("━".repeat(filled), sty("Gauge", gauge_cls)),
         Span::styled(
             "─".repeat(gauge_w.saturating_sub(filled)),
-            Style::default().fg(GAUGE_BG),
+            sty("GaugeTrack", &[]),
         ),
-        Span::styled("╸ ", Style::default().fg(BORDER_BRIGHT)),
+        Span::styled("╸ ", sty("GaugeCap", &[])),
         Span::styled(
             format!("{:.1}%", stats.pct_of_total),
-            Style::default()
-                .fg(gauge_color)
-                .add_modifier(Modifier::BOLD),
+            sty("Gauge", gauge_cls).add_modifier(Modifier::BOLD),
         ),
     ]));
 
@@ -323,33 +278,24 @@ fn render_header_section(f: &mut Frame, stats: &DetailStats, area: Rect) {
         "-".to_string()
     };
     lines.push(Line::from(vec![
-        Span::styled(" ", Style::default().fg(TEXT_DIM)),
-        Span::styled(
-            size_str,
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" │ ", Style::default().fg(BORDER_DIM)),
-        Span::styled(format!("{} files", stats.file_count), Style::default().fg(TEXT_MID)),
-        Span::styled(" │ ", Style::default().fg(BORDER_DIM)),
-        Span::styled(format!("{} dirs", stats.dir_count), Style::default().fg(TEXT_MID)),
-        Span::styled(" │ ", Style::default().fg(BORDER_DIM)),
-        Span::styled(
-            format!("avg {}", avg_str),
-            Style::default().fg(TEXT_DIM),
-        ),
+        Span::styled(" ", sty("Dim", &[])),
+        Span::styled(size_str, sty("StatSize", &[])),
+        Span::styled(" │ ", sty("Sep", &[])),
+        Span::styled(format!("{} files", stats.file_count), sty("StatLabel", &[])),
+        Span::styled(" │ ", sty("Sep", &[])),
+        Span::styled(format!("{} dirs", stats.dir_count), sty("StatLabel", &[])),
+        Span::styled(" │ ", sty("Sep", &[])),
+        Span::styled(format!("avg {}", avg_str), sty("Dim", &[])),
     ]));
 
     // Largest child
     if let Some((ref name, sz)) = stats.largest_child {
         lines.push(Line::from(vec![
-            Span::styled(" ◈ ", Style::default().fg(RED_ACCENT)),
-            Span::styled(
-                pretty_bytes(sz as f64),
-                Style::default().fg(RED_ACCENT),
-            ),
+            Span::styled(" ◈ ", sty("Largest", &[])),
+            Span::styled(pretty_bytes(sz as f64), sty("Largest", &[])),
             Span::styled(
                 format!(" {}", truncate_str(name, w.saturating_sub(16))),
-                Style::default().fg(TEXT_BRIGHT),
+                sty("LargestName", &[]),
             ),
         ]));
     }
@@ -357,7 +303,7 @@ fn render_header_section(f: &mut Frame, stats: &DetailStats, area: Rect) {
     // Separator
     lines.push(Line::from(Span::styled(
         format!(" {}", "─".repeat(w.saturating_sub(2))),
-        Style::default().fg(BORDER_DIM),
+        sty("Hr", &[]),
     )));
 
     let para = Paragraph::new(lines);
@@ -382,16 +328,11 @@ fn render_type_distribution(f: &mut Frame, stats: &DetailStats, area: Rect) {
     let max_rows = area.height as usize;
     let mut lines = vec![Line::from(Span::styled(
         " ◈ Types",
-        Style::default()
-            .fg(ACCENT_CYAN)
-            .add_modifier(Modifier::BOLD),
+        sty("SectionTitle", &[]),
     ))];
 
     if stats.type_distribution.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (empty)",
-            Style::default().fg(TEXT_DIM),
-        )));
+        lines.push(Line::from(Span::styled("  (empty)", sty("Empty", &[]))));
         let para = Paragraph::new(lines);
         f.render_widget(para, area);
         return;
@@ -409,18 +350,19 @@ fn render_type_distribution(f: &mut Frame, stats: &DetailStats, area: Rect) {
         };
         let filled = filled.min(bar_w);
 
+        let ext_style = sty("TypeExt", &[]);
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:>8}", ext_display), Style::default().fg(ACCENT_CYAN)),
-            Span::styled("█".repeat(filled), Style::default().fg(ACCENT_CYAN)),
-            Span::styled("░".repeat(bar_w.saturating_sub(filled)), Style::default().fg(BAR_EMPTY)),
+            Span::styled(format!(" {:>8}", ext_display), ext_style),
+            Span::styled("█".repeat(filled), ext_style),
+            Span::styled(
+                "░".repeat(bar_w.saturating_sub(filled)),
+                sty("Bar", &["empty"]),
+            ),
             Span::styled(
                 format!(" {:>9}", pretty_bytes(*size as f64)),
-                Style::default().fg(TEXT_BRIGHT),
+                sty("TypeSize", &[]),
             ),
-            Span::styled(
-                format!("({:>3})", count),
-                Style::default().fg(TEXT_DIM),
-            ),
+            Span::styled(format!("({:>3})", count), sty("Dim", &[])),
         ]));
     }
 
@@ -432,16 +374,11 @@ fn render_size_histogram(f: &mut Frame, stats: &DetailStats, area: Rect) {
     let max_rows = area.height as usize;
     let mut lines = vec![Line::from(Span::styled(
         " ◈ Size Dist",
-        Style::default()
-            .fg(PURPLE)
-            .add_modifier(Modifier::BOLD),
+        sty("SectionTitle", &["purple"]),
     ))];
 
     if stats.size_histogram.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no files)",
-            Style::default().fg(TEXT_DIM),
-        )));
+        lines.push(Line::from(Span::styled("  (no files)", sty("Empty", &[]))));
         let para = Paragraph::new(lines);
         f.render_widget(para, area);
         return;
@@ -458,14 +395,15 @@ fn render_size_histogram(f: &mut Frame, stats: &DetailStats, area: Rect) {
         };
         let filled = filled.min(bar_w);
 
+        let lbl_style = sty("HistLabel", &[]);
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:>7}", label), Style::default().fg(PURPLE)),
-            Span::styled("█".repeat(filled), Style::default().fg(PURPLE)),
-            Span::styled("░".repeat(bar_w.saturating_sub(filled)), Style::default().fg(PURPLE_DIM)),
+            Span::styled(format!(" {:>7}", label), lbl_style),
+            Span::styled("█".repeat(filled), lbl_style),
             Span::styled(
-                format!(" {:>5}", count),
-                Style::default().fg(TEXT_BRIGHT),
+                "░".repeat(bar_w.saturating_sub(filled)),
+                sty("HistEmpty", &[]),
             ),
+            Span::styled(format!(" {:>5}", count), sty("HistSize", &[])),
         ]));
     }
 
@@ -481,18 +419,16 @@ fn render_top_largest(f: &mut Frame, stats: &DetailStats, area: Rect) {
     let max_rows = area.height as usize;
     let mut lines = vec![Line::from(Span::styled(
         " ◈ Top Largest",
-        Style::default()
-            .fg(AMBER)
-            .add_modifier(Modifier::BOLD),
+        sty("SectionTitle", &["amber"]),
     ))];
 
     for (i, (name, size, _depth)) in stats.top_largest.iter().enumerate().take(max_rows.saturating_sub(1)) {
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:>2}▸", i + 1), Style::default().fg(TEXT_DIM)),
-            Span::styled(format!("{:>9}", pretty_bytes(*size as f64)), Style::default().fg(AMBER)),
+            Span::styled(format!(" {:>2}▸", i + 1), sty("Dim", &[])),
+            Span::styled(format!("{:>9}", pretty_bytes(*size as f64)), sty("TopSize", &[])),
             Span::styled(
                 format!(" {}", truncate_str(name, 20)),
-                Style::default().fg(TEXT_BRIGHT),
+                sty("TopName", &[]),
             ),
         ]));
     }
@@ -526,43 +462,51 @@ fn render_delete_dialog(f: &mut Frame, state: &AppState) {
     let text = vec![
         // Top border with title
         Line::from(vec![
-            Span::styled(top_left, Style::default().fg(RED_ACCENT)),
-            Span::styled(" DELETE CONFIRM ", Style::default().fg(RED_ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(h_line.repeat(w - 17), Style::default().fg(RED_ACCENT)),
-            Span::styled(top_right, Style::default().fg(RED_ACCENT)),
+            Span::styled(top_left, sty("DialogBorder", &[])),
+            Span::styled(" DELETE CONFIRM ", sty("DialogTitle", &[])),
+            Span::styled(h_line.repeat(w - 17), sty("DialogBorder", &[])),
+            Span::styled(top_right, sty("DialogBorder", &[])),
         ]),
         // Divider
         Line::from(vec![
-            Span::styled("║", Style::default().fg(Color::Rgb(120, 30, 30))),
-            Span::styled(format!(" {:<width$}", format!("▸ Target: {}", kind), width = w - 2), Style::default().fg(RED_ACCENT)),
-            Span::styled("║", Style::default().fg(Color::Rgb(120, 30, 30))),
+            Span::styled("║", sty("DialogDivider", &[])),
+            Span::styled(
+                format!(" {:<width$}", format!("▸ Target: {}", kind), width = w - 2),
+                sty("DialogTarget", &[]),
+            ),
+            Span::styled("║", sty("DialogDivider", &[])),
         ]),
         // Name + size
         Line::from(vec![
-            Span::styled("║", Style::default().fg(Color::Rgb(120, 30, 30))),
-            Span::styled(format!(" {:<width$}", format!("  {}  [{}]", name, size), width = w - 2),
-                Style::default().fg(ACCENT_GLOW).add_modifier(Modifier::BOLD)),
-            Span::styled("║", Style::default().fg(Color::Rgb(120, 30, 30))),
+            Span::styled("║", sty("DialogDivider", &[])),
+            Span::styled(
+                format!(" {:<width$}", format!("  {}  [{}]", name, size), width = w - 2),
+                sty("DialogName", &[]),
+            ),
+            Span::styled("║", sty("DialogDivider", &[])),
         ]),
         // Divider with warning
         Line::from(vec![
-            Span::styled("║", Style::default().fg(Color::Rgb(120, 30, 30))),
-            Span::styled(format!(" {:<width$}", "⚠  This action cannot be undone.", width = w - 2), Style::default().fg(Color::Yellow)),
-            Span::styled("║", Style::default().fg(Color::Rgb(120, 30, 30))),
+            Span::styled("║", sty("DialogDivider", &[])),
+            Span::styled(
+                format!(" {:<width$}", "⚠  This action cannot be undone.", width = w - 2),
+                sty("DialogWarn", &[]),
+            ),
+            Span::styled("║", sty("DialogDivider", &[])),
         ]),
         // Bottom border
         Line::from(vec![
-            Span::styled(bot_left, Style::default().fg(RED_ACCENT)),
-            Span::styled(h_line.repeat(w - 2), Style::default().fg(RED_ACCENT)),
-            Span::styled(bot_right, Style::default().fg(RED_ACCENT)),
+            Span::styled(bot_left, sty("DialogBorder", &[])),
+            Span::styled(h_line.repeat(w - 2), sty("DialogBorder", &[])),
+            Span::styled(bot_right, sty("DialogBorder", &[])),
         ]),
         // Prompt below the box
         Line::from(vec![
-            Span::styled("  [", Style::default().fg(TEXT_DIM)),
-            Span::styled("y", Style::default().fg(GREEN_ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled("] confirm   [", Style::default().fg(TEXT_DIM)),
-            Span::styled("n/Esc", Style::default().fg(RED_ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled("] abort", Style::default().fg(TEXT_DIM)),
+            Span::styled("  [", sty("DialogKey", &[])),
+            Span::styled("y", sty("DialogConfirm", &[])),
+            Span::styled("] confirm   [", sty("DialogKey", &[])),
+            Span::styled("n/Esc", sty("DialogAbort", &[])),
+            Span::styled("] abort", sty("DialogKey", &[])),
         ]),
     ];
 
@@ -571,7 +515,7 @@ fn render_delete_dialog(f: &mut Frame, state: &AppState) {
     let area = centered_rect(dialog_width, dialog_height, f.area());
 
     f.render_widget(Clear, area);
-    let para = Paragraph::new(text).style(Style::default().bg(Color::Rgb(20, 4, 8)));
+    let para = Paragraph::new(text).style(sty("Dialog", &[]));
     f.render_widget(para, area);
 }
 
@@ -590,34 +534,38 @@ fn centered_rect(width: usize, height: usize, r: Rect) -> Rect {
 // ── Status bar ─────────────────────────────────────────────
 
 fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let hidden_color = if state.show_hidden { GREEN_ACCENT } else { TEXT_DIM };
+    let hidden_cls: &[&str] = if state.show_hidden { &["on"] } else { &[] };
     let status = Line::from(vec![
-        Span::styled(" ▌", Style::default().fg(BORDER_BRIGHT)),
+        Span::styled(" ▌", sty("StatusGlyph", &[])),
         Span::styled(
             format!("{}", state.visible.len()),
-            Style::default().fg(ACCENT_GLOW).add_modifier(Modifier::BOLD),
+            sty("StatusCount", &[]),
         ),
-        Span::styled("▐ ", Style::default().fg(BORDER_BRIGHT)),
-        Span::styled("q", Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("uit ", Style::default().fg(TEXT_DIM)),
-        Span::styled("/", Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("find ", Style::default().fg(TEXT_DIM)),
-        Span::styled(".", Style::default().fg(hidden_color).add_modifier(Modifier::BOLD)),
-        Span::styled("hide ", Style::default().fg(TEXT_DIM)),
-        Span::styled("x", Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("del ", Style::default().fg(TEXT_DIM)),
-        Span::styled("a", Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("size ", Style::default().fg(TEXT_DIM)),
-        Span::styled("d", Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("cd ", Style::default().fg(TEXT_DIM)),
-        Span::styled("u", Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("up", Style::default().fg(TEXT_DIM)),
+        Span::styled("▐ ", sty("StatusGlyph", &[])),
+        Span::styled("q", sty("StatusKey", &[])),
+        Span::styled("uit ", sty("StatusHint", &[])),
+        Span::styled("/", sty("StatusKey", &[])),
+        Span::styled("find ", sty("StatusHint", &[])),
+        Span::styled(".", sty("StatusHidden", hidden_cls)),
+        Span::styled("hide ", sty("StatusHint", &[])),
+        Span::styled("x", sty("StatusKey", &[])),
+        Span::styled("del ", sty("StatusHint", &[])),
+        Span::styled("a", sty("StatusKey", &[])),
+        Span::styled("size ", sty("StatusHint", &[])),
+        Span::styled("d", sty("StatusKey", &[])),
+        Span::styled("cd ", sty("StatusHint", &[])),
+        Span::styled("u", sty("StatusKey", &[])),
+        Span::styled("up", sty("StatusHint", &[])),
     ]);
-    let para = Paragraph::new(status).style(Style::default().bg(BG_DEEP));
+    let para = Paragraph::new(status).style(sty("Status", &[]));
     f.render_widget(para, area);
 }
 
 // ── Loading ────────────────────────────────────────────────
+//
+// The splash is a procedural, per-frame animation (cycling title glow,
+// traveling scan pulse, drifting particles). It is intentionally NOT driven by
+// the CSS theme — these colors are animation, not discrete themable states.
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -854,5 +802,95 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{}…", truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Render the CSS-driven UI into a TestBackend buffer and assert that key
+    //! cells resolve to the exact palette colors they had before the refactor.
+    //! This is the regression guard for "the UI must not change": if a CSS
+    //! value drifts or a selector stops matching, these assertions fail.
+
+    use super::*;
+    use crate::DiskItem;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn render_buffer() -> ratatui::buffer::Buffer {
+        let root = DiskItem {
+            name: "root".into(),
+            disk_size: 1000,
+            children: Some(vec![
+                DiskItem {
+                    name: "big".into(),
+                    disk_size: 800,
+                    children: Some(vec![]),
+                },
+                DiskItem {
+                    name: "a.txt".into(),
+                    disk_size: 200,
+                    children: None,
+                },
+            ]),
+        };
+        let mut state = AppState::from_disk_item_with_apparent(root, "/root".into(), 1000, false);
+        let detail = state.detail_stats_cloned();
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state, &detail)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn title_bar_uses_theme_colors() {
+        let buf = render_buffer();
+        // Row 0: " ▌disk cleaner…" — 'd' at x=2 is accent-cyan on bg-deep.
+        let d = &buf[(2, 0)];
+        assert_eq!(d.fg, Color::Rgb(0, 210, 210), "title 'disk cleaner' fg");
+        assert_eq!(d.bg, Color::Rgb(8, 10, 18), "title bg");
+    }
+
+    #[test]
+    fn selected_root_row_colors() {
+        let buf = render_buffer();
+        // Row 1: root item (depth 0, selected). Indicator '◉' at x=0.
+        let ind = &buf[(0, 1)];
+        assert_eq!(ind.fg, Color::Rgb(80, 255, 255), "selected indicator fg (glow)");
+        assert_eq!(ind.bg, Color::Rgb(0, 35, 50), "selected row bg (sel-bg)");
+        // pct '1' of "100.0%" at x=3 — root threshold → green.
+        let pct = &buf[(3, 1)];
+        assert_eq!(pct.fg, Color::Rgb(60, 230, 130), "root pct fg (green)");
+        assert_eq!(pct.bg, Color::Rgb(0, 35, 50), "pct cell bg");
+    }
+
+    #[test]
+    fn detail_panel_left_border_is_dim() {
+        let buf = render_buffer();
+        // Right panel starts at x=66 (55% of 120); its left border is border-dim.
+        let border = &buf[(66, 10)];
+        assert_eq!(border.symbol(), "│", "left border glyph");
+        assert_eq!(border.fg, Color::Rgb(0, 50, 55), "detail left border fg (border-dim)");
+    }
+
+    #[test]
+    fn status_bar_glyph_is_border_bright() {
+        let buf = render_buffer();
+        // Status bar is the last row (39); '▌' glyph at x=1.
+        let glyph = &buf[(1, 39)];
+        assert_eq!(glyph.fg, Color::Rgb(0, 120, 120), "status glyph fg (border-bright)");
+    }
+
+    #[test]
+    fn non_selected_item_uses_panel_bg() {
+        let buf = render_buffer();
+        // Second visible row (the 'big' child) is not selected → bg-panel.
+        // It sits at row 2. 'b' of "big/" — find any painted cell on row 2.
+        let cell = (0..66)
+            .map(|x| &buf[(x, 2)])
+            .find(|c| c.fg == Color::Rgb(0, 190, 190))
+            .expect("dir name in accent dir-cyan exists on row 2");
+        assert_eq!(cell.bg, Color::Rgb(12, 15, 25), "non-selected row bg (bg-panel)");
     }
 }
