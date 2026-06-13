@@ -84,10 +84,7 @@ Name.dir        { color: var(--dir-cyan); }
 Name.selected   { color: var(--accent-glow); font-weight: bold; }
 
 /* ── Detail panel (right) ───────────────────────────────── */
-/* NOTE: ratatui-style 0.1.1 does not resolve var() inside border colors, so
- * the border color uses the literal hex (== --border-dim) rather than the
- * token. The value stays in sync with --border-dim above. */
-DetailPanel { border-left: single #003237; background: var(--bg-panel); }
+DetailPanel { border-left: single var(--border-dim); background: var(--bg-panel); }
 
 Crumb       { color: var(--accent-cyan); font-weight: bold; }
 

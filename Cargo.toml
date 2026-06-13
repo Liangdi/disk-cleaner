@@ -20,7 +20,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 ratatui = "0.30"
 crossterm = "0.29"
-ratatui-style = "0.1.1"
+ratatui-style = "0.1.2"
 walkdir = "2"
 
 [dev-dependencies]
