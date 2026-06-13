@@ -1,0 +1,39 @@
+[package]
+name = "disk-cleaner"
+version = "0.1.0"
+authors = ["Liangdi <wu@liangdi.me>"]
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+description = "A disk usage cli similar to windirstat"
+repository = "https://github.com/Liangdi/disk-cleaner"
+keywords = ["cli", "disk", "usage", "tree", "windirstat"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rayon = "1.12.0"
+pretty-bytes = "0.2.2"
+termcolor = "1.4.1"
+atty = "0.2.14"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+ratatui = "0.30"
+crossterm = "0.29"
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
+
+[target.'cfg(windows)'.dependencies.winapi]
+version = "0.3.9"
+features = ["winerror"]
+
+[profile.release]
+lto = 'fat'
+codegen-units = 1
+incremental = false
+
+[[bin]]
+bench = false
+path = "src/bin/main.rs"
+name = "disk"
