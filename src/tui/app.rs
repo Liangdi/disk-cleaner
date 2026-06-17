@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::{dir_size, DiskItem, ScanOptions};
@@ -64,8 +64,6 @@ pub struct DetailStats {
     pub file_count: usize,
     /// Number of direct child directories.
     pub dir_count: usize,
-    /// Total descendant count (files + dirs).
-    pub total_descendants: usize,
     /// Name and size of the largest direct child.
     pub largest_child: Option<(String, u64)>,
     /// File type distribution: (extension, size, count).
@@ -157,10 +155,11 @@ pub struct AppState {
 
 /// Default `ScanOptions` used by the Projects view (no symlink following,
 /// same-filesystem off — matching kondo's defaults).
-fn scan_opts() -> ScanOptions {
+fn scan_opts(apparent: bool) -> ScanOptions {
     ScanOptions {
         follow_symlinks: false,
         same_file_system: false,
+        apparent,
     }
 }
 
@@ -350,8 +349,6 @@ impl AppState {
             }
         }
 
-        let total_descendants = item.direct_children.len();
-
         // Type distribution: top 8 by size
         let mut type_distribution: Vec<(String, u64, usize)> = ext_map
             .into_iter()
@@ -386,7 +383,6 @@ impl AppState {
             pct_of_total,
             file_count,
             dir_count,
-            total_descendants,
             largest_child,
             type_distribution,
             top_largest,
@@ -516,6 +512,9 @@ impl AppState {
     }
 
     pub fn toggle_expand(&mut self) {
+        if self.visible.is_empty() {
+            return;
+        }
         let idx = self.visible[self.selected];
         if !self.items[idx].has_children {
             return;
@@ -529,6 +528,9 @@ impl AppState {
     }
 
     pub fn enter(&mut self) {
+        if self.visible.is_empty() {
+            return;
+        }
         let idx = self.visible[self.selected];
         let has_children = self.items[idx].has_children;
         if !has_children {
@@ -549,6 +551,9 @@ impl AppState {
     }
 
     pub fn back(&mut self) {
+        if self.visible.is_empty() {
+            return;
+        }
         let idx = self.visible[self.selected];
         let depth = self.items[idx].depth;
         if depth == 0 {
@@ -576,6 +581,9 @@ impl AppState {
 
     /// Request to enter the selected directory (rescan).
     pub fn enter_dir(&mut self) {
+        if self.visible.is_empty() {
+            return;
+        }
         let idx = self.visible[self.selected];
         if !self.items[idx].has_children {
             return;
@@ -647,7 +655,7 @@ impl AppState {
                 return br.clone();
             }
         }
-        let breakdown = compute_breakdown(&self.projects[idx]);
+        let breakdown = compute_breakdown(&self.projects[idx], self.apparent);
         self.cached_project_detail = Some((idx, breakdown.clone()));
         breakdown
     }
@@ -732,7 +740,7 @@ impl AppState {
             return;
         }
         let idx = self.projects_selected;
-        self.clean_breakdown = compute_breakdown(&self.projects[idx]);
+        self.clean_breakdown = compute_breakdown(&self.projects[idx], self.apparent);
         self.clean_target = Some(idx);
     }
 
@@ -760,8 +768,8 @@ impl AppState {
 /// Compute the non-empty `(name, size)` artifact-directory breakdown for a
 /// project, sorted largest first. Each directory is walked once via
 /// [`dir_size`](crate::dir_size); callers cache the result.
-fn compute_breakdown(entry: &ProjectEntry) -> Vec<(String, u64)> {
-    let opts = scan_opts();
+fn compute_breakdown(entry: &ProjectEntry, apparent: bool) -> Vec<(String, u64)> {
+    let opts = scan_opts(apparent);
     let mut breakdown: Vec<(String, u64)> = entry
         .artifact_dir_names
         .iter()
@@ -788,6 +796,21 @@ mod tests {
             last_modified: Some(SystemTime::UNIX_EPOCH),
             artifact_dir_names: vec!["target".to_string()],
         }
+    }
+
+    /// Regression: a search with no matches (or a failed scan) leaves `visible`
+    /// empty. The disk-mode nav methods used to index `visible[selected]`
+    /// unconditionally and panicked; they must now bail out cleanly.
+    #[test]
+    fn nav_methods_do_not_panic_on_empty_visible() {
+        let mut s = AppState::new_empty("/".into(), false);
+        assert!(s.visible.is_empty(), "fixture must start with empty visible");
+        s.toggle_expand();
+        s.enter();
+        s.back();
+        s.enter_dir();
+        // Still empty and intact — no panic, no spurious state change.
+        assert!(s.visible.is_empty());
     }
 
     #[test]
@@ -871,7 +894,10 @@ pub fn flatten_disk_item(
     let full_path = if depth == 0 {
         parent_path.clone()
     } else {
-        format!("{}/{}", parent_path, item.name)
+        PathBuf::from(&parent_path)
+            .join(&item.name)
+            .to_string_lossy()
+            .into_owned()
     };
 
     out.push(FlatItem {

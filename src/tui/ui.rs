@@ -742,6 +742,9 @@ fn relative_time(t: SystemTime) -> String {
 
 // ── Delete confirmation dialog (HUD style) ──────────────────
 
+/// Outer width (in cells) of the delete-confirm dialog box.
+const DELETE_DIALOG_W: usize = 54;
+
 fn render_delete_dialog(f: &mut Frame, state: &AppState) {
     let idx = match state.delete_target {
         Some(i) => i,
@@ -752,71 +755,61 @@ fn render_delete_dialog(f: &mut Frame, state: &AppState) {
     let kind = if is_dir { "DIRECTORY" } else { "FILE" };
     let name = &item.name;
     let size = pretty_bytes(item.disk_size as f64);
-    let w = 52usize;
+    let inner_w = DELETE_DIALOG_W.saturating_sub(2);
 
-    // HUD frame — manual box-drawing for sci-fi feel
-    let top_left = "╔";
-    let top_right = "╗";
-    let bot_left = "╚";
-    let bot_right = "╝";
-    let h_line = "═";
-    let _ = (); // border chars used inline below
+    // HUD frame — box-drawing via boxed_line keeps top/mid/bottom equally wide.
+    let title = " DELETE CONFIRM ";
 
-    let text = vec![
-        // Top border with title
-        Line::from(vec![
-            Span::styled(top_left, sty("DialogBorder", &[])),
-            Span::styled(" DELETE CONFIRM ", sty("DialogTitle", &[])),
-            Span::styled(h_line.repeat(w - 17), sty("DialogBorder", &[])),
-            Span::styled(top_right, sty("DialogBorder", &[])),
-        ]),
-        // Divider
-        Line::from(vec![
-            Span::styled("║", sty("DialogDivider", &[])),
-            Span::styled(
-                format!(" {:<width$}", format!("▸ Target: {}", kind), width = w - 2),
-                sty("DialogTarget", &[]),
-            ),
-            Span::styled("║", sty("DialogDivider", &[])),
-        ]),
-        // Name + size
-        Line::from(vec![
-            Span::styled("║", sty("DialogDivider", &[])),
-            Span::styled(
-                format!(" {:<width$}", format!("  {}  [{}]", name, size), width = w - 2),
-                sty("DialogName", &[]),
-            ),
-            Span::styled("║", sty("DialogDivider", &[])),
-        ]),
-        // Divider with warning
-        Line::from(vec![
-            Span::styled("║", sty("DialogDivider", &[])),
-            Span::styled(
-                format!(" {:<width$}", "⚠  This action cannot be undone.", width = w - 2),
-                sty("DialogWarn", &[]),
-            ),
-            Span::styled("║", sty("DialogDivider", &[])),
-        ]),
-        // Bottom border
-        Line::from(vec![
-            Span::styled(bot_left, sty("DialogBorder", &[])),
-            Span::styled(h_line.repeat(w - 2), sty("DialogBorder", &[])),
-            Span::styled(bot_right, sty("DialogBorder", &[])),
-        ]),
-        // Prompt below the box
-        Line::from(vec![
-            Span::styled("  [", sty("DialogKey", &[])),
-            Span::styled("y", sty("DialogConfirm", &[])),
-            Span::styled("] confirm   [", sty("DialogKey", &[])),
-            Span::styled("n/Esc", sty("DialogAbort", &[])),
-            Span::styled("] abort", sty("DialogKey", &[])),
-        ]),
-    ];
+    // Truncate the name so the "  <name>  [<size>]" line never overflows inner_w.
+    // Fixed overhead: 2 leading spaces + "  " before size + "[" + "]" = 5 chars,
+    // plus the size itself.
+    let overhead = 5 + size.chars().count();
+    let name_max = inner_w.saturating_sub(overhead);
+    let name_disp = truncate_str(name, name_max);
+    let name_line = format!("  {}  [{}]", name_disp, size);
 
-    let dialog_width = (w + 2) as usize;
-    let dialog_height = 6usize;
-    let area = centered_rect(dialog_width, dialog_height, f.area());
+    let mut text: Vec<Line> = Vec::new();
 
+    // Top border + title
+    text.push(Line::from(vec![
+        Span::styled("╔", sty("DialogBorder", &[])),
+        Span::styled(title, sty("DialogTitle", &[])),
+        Span::styled(
+            "═".repeat(inner_w.saturating_sub(title.chars().count())),
+            sty("DialogBorder", &[]),
+        ),
+        Span::styled("╗", sty("DialogBorder", &[])),
+    ]));
+
+    text.push(boxed_line(
+        &format!("▸ Target: {}", kind),
+        inner_w,
+        sty("DialogTarget", &[]),
+    ));
+    text.push(boxed_line(&name_line, inner_w, sty("DialogName", &[])));
+    text.push(boxed_line(
+        "⚠  This action cannot be undone.",
+        inner_w,
+        sty("DialogWarn", &[]),
+    ));
+
+    // Bottom border
+    text.push(Line::from(vec![
+        Span::styled("╚", sty("DialogBorder", &[])),
+        Span::styled("═".repeat(inner_w), sty("DialogBorder", &[])),
+        Span::styled("╝", sty("DialogBorder", &[])),
+    ]));
+
+    // Prompt below the box
+    text.push(Line::from(vec![
+        Span::styled("  [", sty("DialogKey", &[])),
+        Span::styled("y", sty("DialogConfirm", &[])),
+        Span::styled("] confirm   [", sty("DialogKey", &[])),
+        Span::styled("n/Esc", sty("DialogAbort", &[])),
+        Span::styled("] abort", sty("DialogKey", &[])),
+    ]));
+
+    let area = centered_rect(DELETE_DIALOG_W, text.len(), f.area());
     f.render_widget(Clear, area);
     let para = Paragraph::new(text).style(sty("Dialog", &[]));
     f.render_widget(para, area);

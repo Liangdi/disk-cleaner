@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let file_info = FileInfo::from_path(&target_dir, config.apparent)?;
+    let file_info = FileInfo::from_path(target_dir, config.apparent)?;
 
     let is_tty = atty::is(Stream::Stdout);
     let color_choice = if is_tty {
@@ -173,7 +173,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let analysed = match file_info {
         FileInfo::Directory { volume_id } => {
-            let result = DiskItem::from_analyze(&target_dir, config.apparent, volume_id);
+            let result = DiskItem::from_analyze(target_dir, config.apparent, volume_id);
             // Stop the spinner and clear its line whether the scan succeeded
             // or errored, so a failure leaves no stray spinner behind.
             if let Some(s) = spinner.as_mut() {
@@ -204,7 +204,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // the helper so the tree is visible before the (second, slower) walk and
     // before any interactive prompt. Interactive only when both stdout and
     // stdin are TTYs; otherwise the list is printed read-only.
-    run_projects_flow(target_dir, &stdout, buffer)?;
+    run_projects_flow(target_dir, &stdout, buffer, config.apparent)?;
 
     Ok(())
 }
@@ -222,6 +222,7 @@ fn run_projects_flow(
     target_dir: &PathBuf,
     stdout: &BufferWriter,
     buffer: Buffer,
+    apparent: bool,
 ) -> Result<(), Box<dyn Error>> {
     let interactive = atty::is(Stream::Stdout) && atty::is(Stream::Stdin);
     let is_tty = atty::is(Stream::Stdout);
@@ -235,6 +236,7 @@ fn run_projects_flow(
     let opts = ScanOptions {
         follow_symlinks: false,
         same_file_system: false,
+        apparent,
     };
 
     // Spin while walking the tree for build-artifact projects. Only on a TTY —
@@ -255,7 +257,7 @@ fn run_projects_flow(
         s.stop();
     }
 
-    projects.sort_by(|a, b| b.artifact_size.cmp(&a.artifact_size));
+    projects.sort_by_key(|b| std::cmp::Reverse(b.artifact_size));
 
     if projects.is_empty() {
         writeln!(&mut buffer, "No reclaimable build artifacts found.")?;
@@ -486,7 +488,7 @@ fn show_item(item: &DiskItem, info: &DisplayInfo, buffer: &mut Buffer) -> io::Re
     write!(buffer, "{}{}", info.indents, info.prefix())?;
     // Percentage
     buffer.set_color(ColorSpec::new().set_fg(info.color()))?;
-    write!(buffer, " {} ", format!("{:.2}%", info.fraction))?;
+    write!(buffer, " {:.2}% ", info.fraction)?;
     // Disk size
     buffer.reset()?;
     write!(buffer, "[{}]", pretty_bytes(item.disk_size as f64),)?;
@@ -601,7 +603,7 @@ struct Config {
 
 fn parse_percent(src: &str) -> Result<f64, Box<dyn Error + Send + Sync>> {
     let num = src.parse::<f64>()?;
-    if num >= 0.0 && num <= 100.0 {
+    if (0.0..=100.0).contains(&num) {
         Ok(num)
     } else {
         Err("Percentage must be in range [0, 100].".into())

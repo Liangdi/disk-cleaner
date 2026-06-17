@@ -20,7 +20,7 @@
 //! ```no_run
 //! use disk_cleaner::projects::{scan, ScanOptions};
 //!
-//! let opts = ScanOptions { follow_symlinks: false, same_file_system: false };
+//! let opts = ScanOptions { follow_symlinks: false, same_file_system: false, apparent: true };
 //! for project in scan(&".", &opts).filter_map(Result::ok) {
 //!     println!("{} [{}]", project.path.display(), project.type_name());
 //! }
@@ -677,6 +677,10 @@ pub struct ScanOptions {
     pub follow_symlinks: bool,
     /// Whether to restrict traversal to the same filesystem as the root.
     pub same_file_system: bool,
+    /// When `true`, count each file's logical length (`metadata.len()`); when
+    /// `false`, count its on-disk allocation (Unix `blocks()*512`, Windows
+    /// compressed size).
+    pub apparent: bool,
 }
 
 fn build_walkdir_iter<P: AsRef<path::Path>>(path: &P, options: &ScanOptions) -> ProjectIter {
@@ -709,6 +713,33 @@ pub fn scan<P: AsRef<path::Path>>(
     build_walkdir_iter(path, options)
 }
 
+/// Single file's counted size: its logical length when `apparent`, otherwise
+/// its on-disk allocation. Mirrors the size semantics of `FileInfo::from_path`
+/// but operates on borrowed metadata already obtained by walkdir (no re-stat).
+fn file_size(md: &fs::Metadata, path: &Path, apparent: bool) -> u64 {
+    if apparent {
+        md.len()
+    } else {
+        allocated_size(md, path)
+    }
+}
+
+#[cfg(unix)]
+fn allocated_size(md: &fs::Metadata, _path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    md.blocks() * 512
+}
+
+#[cfg(windows)]
+fn allocated_size(md: &fs::Metadata, path: &Path) -> u64 {
+    crate::ffi::compressed_size(path).unwrap_or_else(|_| md.len())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn allocated_size(md: &fs::Metadata, _path: &Path) -> u64 {
+    md.len()
+}
+
 /// Total size in bytes of all regular files beneath `path` (recursive),
 /// traversed with the same options as [`scan`].
 ///
@@ -718,8 +749,10 @@ pub fn dir_size<P: AsRef<path::Path>>(path: &P, options: &ScanOptions) -> u64 {
         .it
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter_map(|e| e.metadata().ok())
-        .map(|e| e.len())
+        .filter_map(|e| {
+            let md = e.metadata().ok()?;
+            Some(file_size(&md, e.path(), options.apparent))
+        })
         .sum()
 }
 
@@ -777,7 +810,7 @@ fn project_size_and_mtime(project: &Project, options: &ScanOptions) -> (u64, Opt
             .iter()
             .any(|prefix| entry.path().starts_with(prefix))
         {
-            total_artifact_size += metadata.len();
+            total_artifact_size += file_size(&metadata, entry.path(), options.apparent);
         }
 
         // mtime accounting: every file, not just artifacts.
@@ -849,6 +882,7 @@ mod tests {
         ScanOptions {
             follow_symlinks: false,
             same_file_system: false,
+            apparent: true,
         }
     }
 

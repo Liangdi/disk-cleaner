@@ -398,10 +398,12 @@ fn start_projects_scan(
 
     let tx = tx.clone();
     let path_owned = path;
+    let apparent = state.apparent;
     std::thread::spawn(move || {
         let opts = ScanOptions {
             follow_symlinks: false,
             same_file_system: false,
+            apparent,
         };
         let entries: Vec<app::ProjectEntry> = analyze(&path_owned, &opts)
             .map(|pa| app::ProjectEntry {
@@ -442,10 +444,12 @@ fn start_clean_all(tx: &mpsc::Sender<ProjectScanResult>, state: &mut app::AppSta
     state.disk_stale = true;
 
     let tx = tx.clone();
+    let apparent = state.apparent;
     std::thread::spawn(move || {
         let opts = ScanOptions {
             follow_symlinks: false,
             same_file_system: false,
+            apparent,
         };
         let mut errors: Vec<String> = Vec::new();
         for path in &paths {

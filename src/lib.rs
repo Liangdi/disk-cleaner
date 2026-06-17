@@ -67,54 +67,19 @@ impl DiskItem {
         }
     }
 
-    /// Scan one level of children, but compute full recursive size for each child.
-    /// Children of directories are set to empty Vec (expanded on demand via `d`).
+    /// Build a fully-recursive `DiskItem` tree for `path`.
+    ///
+    /// Despite the historical name, this is *not* a shallow scan: it performs a
+    /// complete recursive analysis of the entire subtree, identical to
+    /// [`DiskItem::from_analyze`]. The separate entry point is kept only so the
+    /// TUI's `do_shallow_scan` call site reads naturally. New code should call
+    /// [`DiskItem::from_analyze`] directly.
     pub fn from_shallow_scan(
         path: &Path,
         apparent: bool,
         root_dev: u64,
     ) -> Result<Self, Box<dyn Error>> {
-        let name = path
-            .file_name()
-            .unwrap_or(&OsStr::new("."))
-            .to_string_lossy()
-            .to_string();
-
-        let file_info = FileInfo::from_path(path, apparent)?;
-
-        match file_info {
-            FileInfo::Directory { volume_id } => {
-                if volume_id != root_dev {
-                    return Err("Filesystem boundary crossed".into());
-                }
-
-                let sub_entries = fs::read_dir(path)?
-                    .filter_map(Result::ok)
-                    .collect::<Vec<_>>();
-
-                let mut sub_items: Vec<DiskItem> = sub_entries
-                    .par_iter()
-                    .filter_map(|entry| {
-                        DiskItem::from_analyze(&entry.path(), apparent, root_dev).ok()
-                    })
-                    .collect();
-
-                sub_items.sort_unstable_by(|a, b| a.disk_size.cmp(&b.disk_size).reverse());
-
-                let total: u64 = sub_items.iter().map(|di| di.disk_size).sum();
-
-                Ok(DiskItem {
-                    name,
-                    disk_size: total,
-                    children: Some(sub_items),
-                })
-            }
-            FileInfo::File { size, .. } => Ok(DiskItem {
-                name,
-                disk_size: size,
-                children: None,
-            }),
-        }
+        Self::from_analyze(path, apparent, root_dev)
     }
 }
 
