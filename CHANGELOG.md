@@ -1,8 +1,17 @@
+## [0.1.3] - 2026-06-17
+
+### 🐛 Bug Fixes
+
+- TUI panic on empty tree, honor apparent size, and misc cleanups
 ## [0.1.2] - 2026-06-17
 
 ### 🚀 Features
 
 - *(cli)* Show logo and spinner during scans
+
+### ⚙️ Miscellaneous Tasks
+
+- Release disk-cleaner version 0.1.2
 ## [0.1.1] - 2026-06-17
 
 ### 🚀 Features
