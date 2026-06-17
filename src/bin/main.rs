@@ -8,6 +8,10 @@ use std::error::Error;
 use std::io;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use std::time::SystemTime;
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
@@ -60,6 +64,58 @@ fn print_logo(buffer: &mut Buffer) -> io::Result<()> {
     Ok(())
 }
 
+/// A terminal spinner shown while a long synchronous operation (the directory
+/// scan) runs on the main thread. The animation runs on a background thread and
+/// is stopped — and its line cleared — by [`Spinner::stop`] or drop, so the
+/// spinner never lingers even if the scan returns an error.
+struct Spinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    /// Start a spinner labelled `label`. Only call this when stdout is a TTY:
+    /// it writes raw `\r`/ANSI control codes straight to stdout.
+    fn start(label: &str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let label = label.to_string();
+        let handle = thread::spawn(move || {
+            // Braille spinner frames.
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut out = io::stdout();
+            let mut i = 0;
+            while !stop_flag.load(Ordering::Relaxed) {
+                let _ = write!(out, "\r\x1b[36m{}\x1b[0m {}", frames[i], label);
+                let _ = out.flush();
+                i = (i + 1) % frames.len();
+                thread::sleep(Duration::from_millis(80));
+            }
+            // Wipe the spinner line so later output starts clean.
+            let _ = write!(out, "\r\x1b[2K");
+            let _ = out.flush();
+        });
+        Spinner {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Signal the background thread to stop and clear its line.
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 mod shape {
     pub const INDENT: &str = "│";
     pub const _LAST_WITH_CHILDREN: &str = "└─┬";
@@ -83,29 +139,54 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let file_info = FileInfo::from_path(&target_dir, config.apparent)?;
 
-    let color_choice = if atty::is(Stream::Stdout) {
+    let is_tty = atty::is(Stream::Stdout);
+    let color_choice = if is_tty {
         ColorChoice::Auto
     } else {
         ColorChoice::Never
     };
 
     let stdout = BufferWriter::stdout(color_choice);
-    let mut buffer = stdout.buffer();
 
-    if !config.json {
-        if atty::is(Stream::Stdout) {
-            print_logo(&mut buffer)?;
-            writeln!(&mut buffer)?;
+    // Print the logo + "Analyzing" header up front and flush immediately, so
+    // they're visible before the (potentially slow) scan begins.
+    {
+        let mut intro = stdout.buffer();
+        if !config.json {
+            if is_tty {
+                print_logo(&mut intro)?;
+                writeln!(&mut intro)?;
+            }
+            writeln!(&mut intro, "Analyzing: {}\n", target_dir.display())?;
+            stdout.print(&intro)?;
         }
-        writeln!(&mut buffer, "Analyzing: {}\n", target_dir.display())?;
+    }
+
+    // Spin on the line below "Analyzing" while the scan runs. Only when stdout
+    // is a TTY and we're emitting human output — a piped/redirected stream
+    // must not receive the spinner's `\r`/ANSI control codes.
+    let mut spinner = if !config.json && is_tty {
+        Some(Spinner::start("Scanning directory..."))
+    } else {
+        None
     };
 
     let analysed = match file_info {
         FileInfo::Directory { volume_id } => {
-            DiskItem::from_analyze(&target_dir, config.apparent, volume_id)?
+            let result = DiskItem::from_analyze(&target_dir, config.apparent, volume_id);
+            // Stop the spinner and clear its line whether the scan succeeded
+            // or errored, so a failure leaves no stray spinner behind.
+            if let Some(s) = spinner.as_mut() {
+                s.stop();
+            }
+            result?
         }
         _ => return Err(format!("{} is not a directory!", target_dir.display()).into()),
     };
+
+    // Fresh buffer for everything after the scan — the intro buffer above was
+    // already flushed and still holds its old contents, so don't reuse it.
+    let mut buffer = stdout.buffer();
 
     if config.json {
         let serialized = serde_json::to_string(&analysed)?;
@@ -140,18 +221,40 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run_projects_flow(
     target_dir: &PathBuf,
     stdout: &BufferWriter,
-    mut buffer: Buffer,
+    buffer: Buffer,
 ) -> Result<(), Box<dyn Error>> {
     let interactive = atty::is(Stream::Stdout) && atty::is(Stream::Stdin);
+    let is_tty = atty::is(Stream::Stdout);
+
+    // Flush the directory tree now so it's visible while the second (slower)
+    // project scan runs below. Rebuild a fresh buffer afterwards — the old one
+    // still holds the tree contents and would be re-emitted if reused.
+    stdout.print(&buffer)?;
+    let mut buffer = stdout.buffer();
 
     let opts = ScanOptions {
         follow_symlinks: false,
         same_file_system: false,
     };
 
+    // Spin while walking the tree for build-artifact projects. Only on a TTY —
+    // a piped/redirected stream must not receive the spinner's control codes.
+    let mut spinner = if is_tty {
+        Some(Spinner::start("Scanning for build artifacts..."))
+    } else {
+        None
+    };
+
     // analyze() already drops projects with zero reclaimable bytes and those
     // whose scan errored, so this list is exactly "projects worth cleaning".
     let mut projects: Vec<ProjectAnalysis> = analyze(target_dir, &opts).collect();
+
+    // Stop the spinner and clear its line before printing results, whether the
+    // scan succeeded or errored.
+    if let Some(s) = spinner.as_mut() {
+        s.stop();
+    }
+
     projects.sort_by(|a, b| b.artifact_size.cmp(&a.artifact_size));
 
     if projects.is_empty() {
