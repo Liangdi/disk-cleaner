@@ -1,8 +1,17 @@
+## [0.1.4] - 2026-06-17
+
+### 🐛 Bug Fixes
+
+- *(build)* Enable errhandlingapi and fileapi features for winapi
 ## [0.1.3] - 2026-06-17
 
 ### 🐛 Bug Fixes
 
 - TUI panic on empty tree, honor apparent size, and misc cleanups
+
+### ⚙️ Miscellaneous Tasks
+
+- Release disk-cleaner version 0.1.3
 ## [0.1.2] - 2026-06-17
 
 ### 🚀 Features
